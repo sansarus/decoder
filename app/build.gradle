@@ -1,0 +1,38 @@
+plugins {
+    alias(libs.plugins.android.application)
+}
+
+android {
+    namespace = 'com.openipc.decoder'
+    compileSdk = 36
+
+    defaultConfig {
+        applicationId "com.openipc.decoder"
+        minSdk 21
+        targetSdk 36
+        versionCode 7
+        versionName "1.07"
+    }
+
+    signingConfigs {
+        create("release") {
+            storeFile file("../key.jks")
+            storePassword "release"
+            keyAlias "key"
+            keyPassword "release"
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled = true
+            shrinkResources = true
+            signingConfig = signingConfigs.release
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+}
