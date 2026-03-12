@@ -29,7 +29,7 @@ _During the testing phase, the application is distributed only in binary form, s
 
 ### Version history
 
-**To [receive](https://play.google.com/apps/internaltest/4701231141824898735) or update this app, you need to provide your email through [OpenIPC](https://t.me/openipc) to be added to the Google Play testers list.**
+**To [receive](https://play.google.com/apps/internaltest/4701231141824898735) or update this app, you need to provide your email through [OpenIPC](https://t.me/openipc) to be added to the Google Play testers list or use local [builds](https://github.com/OpenIPC/decoder/releases/tag/latest).**
 
 - v1.07, 2025.11.11
     - Fixed the WebUI window on older devices
