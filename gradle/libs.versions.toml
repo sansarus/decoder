@@ -1,3 +1,9 @@
+#
+# Copyright (c) OpenIPC  https://openipc.org  MIT License
+#
+# libs.versions.toml — Gradle version catalog for dependency and plugin versions
+#
+
 [versions]
 agp = "8.13.1"
 

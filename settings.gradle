@@ -1,3 +1,11 @@
+/*
+ *
+ * Copyright (c) OpenIPC  https://openipc.org  MIT License
+ *
+ * settings.gradle — Gradle project settings and repository configuration
+ *
+ */
+
 pluginManagement {
     repositories {
         google {

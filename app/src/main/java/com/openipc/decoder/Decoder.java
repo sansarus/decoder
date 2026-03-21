@@ -1,8 +1,9 @@
 /*
- * Part of the OpenIPC project — https://openipc.org
- * Targets: IP cameras and embedded Linux (POSIX, uClibc/musl/glibc)
- * Contact: tech@openipc.eu
- * License: MIT
+ *
+ * Copyright (c) OpenIPC  https://openipc.org  MIT License
+ *
+ * Decoder.java — main activity for H.264/H.265 hardware video decoding
+ *
  */
 
 package com.openipc.decoder;

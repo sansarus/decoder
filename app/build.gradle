@@ -1,3 +1,11 @@
+/*
+ *
+ * Copyright (c) OpenIPC  https://openipc.org  MIT License
+ *
+ * build.gradle — Android application module build configuration
+ *
+ */
+
 plugins {
     alias(libs.plugins.android.application)
 }
