@@ -108,6 +108,9 @@ public class Decoder extends Activity {
     private volatile String mHost;
     private volatile boolean mType;
 
+    // tracks last warned unknown RTP payload type to suppress log spam on the network thread
+    private volatile int lastUnknownPayload = -1;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -150,6 +153,7 @@ public class Decoder extends Activity {
     private void loadSettings() {
         SharedPreferences pref = getSharedPreferences("settings", MODE_PRIVATE);
         mHost = pref.getString("host", "rtsp://root:12345@192.168.1.10:554/stream=0");
+        mType = pref.getBoolean("type", false); // false = TCP (default), true = UDP
 
         String link = getIntent().getStringExtra(Intent.EXTRA_TEXT);
         if (link != null) {
@@ -162,6 +166,7 @@ public class Decoder extends Activity {
         SharedPreferences pref = getSharedPreferences("settings", MODE_PRIVATE);
         SharedPreferences.Editor edit = pref.edit();
         edit.putString("host", mHost);
+        edit.putBoolean("type", mType);
         edit.apply();
 
         mConnect.setText(mHost);
@@ -196,6 +201,15 @@ public class Decoder extends Activity {
             return false;
         });
 
+        // toggle between TCP (default) and UDP transport; persisted via saveSettings()
+        TextView typeToggle = createItem(mType ? "Transport: UDP" : "Transport: TCP");
+        header.addView(typeToggle);
+        typeToggle.setOnClickListener(v -> {
+            mType = !mType;
+            typeToggle.setText(mType ? "Transport: UDP" : "Transport: TCP");
+            saveSettings();
+        });
+
         TextView webui = createItem("WebUI");
         layout.addView(webui);
         webui.setOnClickListener(v -> {
@@ -220,7 +234,7 @@ public class Decoder extends Activity {
         }
 
         SpannableString s = new SpannableString(code);
-        s.setSpan(new SuperscriptSpan(), 4, s.length(), 0);
+        s.setSpan(new SuperscriptSpan(),    5, s.length(), 0); // "[V...]" raised, excluding leading space
         s.setSpan(new RelativeSizeSpan(0.5f), 5, s.length(), 0);
 
         TextView exit = createItem("Exit");
@@ -417,6 +431,13 @@ public class Decoder extends Activity {
                 nalBuffer[1] = 0;
                 nalBuffer[2] = 0;
                 nalBuffer[3] = 1;
+
+                // Skip the FU header byte whose type bits were already extracted above.
+                // nalBit++ also steps past the NAL header byte(s) already placed in
+                // nalBuffer[4] (H.264) or nalBuffer[4,5] (H.265) — keeping them intact.
+                nalBit++;
+                cpSize++;
+                rxSize--;
 
                 if (nalBit + rxSize > nalBuffer.length) {  // guard: start fragment overflow
                     Log.e(TAG, "NAL start fragment too large, dropping");
@@ -762,23 +783,36 @@ public class Decoder extends Activity {
             // not from the epoch (lastFrame == 0 would trigger the watchdog immediately)
             lastFrame = SystemClock.elapsedRealtime();
             activeStream = true;
-            if (mType) {
-                try (DatagramSocket d = new DatagramSocket(5000)) {
-                    mUdpSocket = d; // stored so onPause() can close it to unblock receive()
+            try {
+                if (mType) {
+                    try (DatagramSocket d = new DatagramSocket(5000)) {
+                        mUdpSocket = d; // stored so onPause() can close it to unblock receive()
+                        try {
+                            udpStream(d);
+                        } finally {
+                            mUdpSocket = null;
+                        }
+                    }
+                } else {
+                    mTcpSocket = s; // stored so onPause() can close it to unblock read()
                     try {
-                        udpStream(d);
+                        // pass the same InputStream used for handshake — no bytes are lost
+                        tcpStream(input);
                     } finally {
-                        mUdpSocket = null;
+                        mTcpSocket = null;
                     }
                 }
-            } else {
-                mTcpSocket = s; // stored so onPause() can close it to unblock read()
+            } finally {
+                // tell the server to release the session; best-effort — ignore errors if
+                // the socket was already closed by onPause()
                 try {
-                    // pass the same InputStream used for handshake — no bytes are lost
-                    tcpStream(input);
-                } finally {
-                    mTcpSocket = null;
-                }
+                    String teardown = "TEARDOWN " + mHost + " RTSP/1.0\r\n" +
+                            "CSeq: " + (seq + 1) + "\r\n" + auth + UA +
+                            "Session: " + session + "\r\n\r\n";
+                    w.write(teardown.getBytes(StandardCharsets.UTF_8));
+                    w.flush();
+                    Log.d(TAG, "RTSP TEARDOWN sent");
+                } catch (Exception ignored) {}
             }
         }
     }
@@ -859,7 +893,11 @@ public class Decoder extends Activity {
             return;
         }
 
-        Log.w(TAG, "Unknown rtp type: " + payload);
+        // log each new unknown payload type only once to avoid spamming the network thread
+        if (payload != lastUnknownPayload) {
+            lastUnknownPayload = payload;
+            Log.w(TAG, "Unknown rtp type: " + payload);
+        }
     }
 
     private void startListener() {
