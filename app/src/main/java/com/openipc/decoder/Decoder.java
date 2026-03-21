@@ -280,9 +280,14 @@ public class Decoder extends Activity {
 
     @SuppressLint("SetJavaScriptEnabled")
     private void startBrowser() {
+        String link = Uri.parse(mHost).getHost();
+        if (link == null) {
+            Log.w(TAG, "Cannot open WebUI: invalid host in URL");
+            return;
+        }
+
         WebView view = new WebView(this);
         view.getSettings().setJavaScriptEnabled(true);
-        String link = Uri.parse(mHost).getHost();
 
         // Set the auth-capable client BEFORE loadUrl so credentials are
         // available on the very first HTTP 401 challenge.
@@ -323,9 +328,7 @@ public class Decoder extends Activity {
         // release WebView native resources when the dialog is dismissed
         dialog.setOnDismissListener(d -> view.destroy());
 
-        if (link != null) {
-            view.loadUrl("http://" + link);
-        }
+        view.loadUrl("http://" + link);
     }
 
     private void updateResolution(int width, int height) {
@@ -545,17 +548,17 @@ public class Decoder extends Activity {
             MediaCodec.BufferInfo info = mBufferInfo;
             int outputBufferId = mDecoder.dequeueOutputBuffer(info, 0);
 
-            if (outputBufferId >= 0) {
-                MediaFormat format = mDecoder.getOutputFormat(outputBufferId);
-                int mWidth = format.getInteger(MediaFormat.KEY_WIDTH);
+            if (outputBufferId == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                // decoder signals a format change — read resolution from the canonical no-arg call
+                MediaFormat format = mDecoder.getOutputFormat();
+                int mWidth  = format.getInteger(MediaFormat.KEY_WIDTH);
                 int mHeight = format.getInteger(MediaFormat.KEY_HEIGHT);
-
                 if (lastWidth != mWidth || lastHeight != mHeight) {
-                    lastWidth = mWidth;
+                    lastWidth  = mWidth;
                     lastHeight = mHeight;
                     updateResolution(lastWidth, lastHeight);
                 }
-
+            } else if (outputBufferId >= 0) {
                 mDecoder.releaseOutputBuffer(outputBufferId, true);
             }
         } catch (Exception e) {
@@ -605,7 +608,7 @@ public class Decoder extends Activity {
         }
     }
 
-    private void rtsp_connect() throws Exception {
+    private void rtspConnect() throws Exception {
         nalSize = 0; // discard any partial NAL fragment from the previous session
         Uri uri = Uri.parse(mHost);
         try (Socket s = new Socket()) {
@@ -640,8 +643,14 @@ public class Decoder extends Activity {
                 }
                 Log.i(TAG, line);
             }
-            // consume the SDP body — leaving it unread would poison SETUP response parsing
-            if (descContentLength > 0) r.skip(descContentLength);
+            // consume the SDP body — leaving it unread would poison SETUP response parsing.
+            // skip() may return fewer bytes than requested, so loop until fully consumed.
+            long remaining = descContentLength;
+            while (remaining > 0) {
+                long skipped = r.skip(remaining);
+                if (skipped <= 0) break; // EOF or stream error
+                remaining -= skipped;
+            }
 
             seq++;
             String type = mType ? "RTP/AVP/UDP;unicast;client_port=5000"
@@ -694,24 +703,27 @@ public class Decoder extends Activity {
             activeStream = true;
             if (mType) {
                 try (DatagramSocket d = new DatagramSocket(5000)) {
-                    udp_stream(d);
+                    udpStream(d);
                 }
             } else {
-                tcp_stream(s.getInputStream());
+                tcpStream(s.getInputStream());
             }
         }
     }
 
-    private void udp_stream(DatagramSocket d) throws IOException {
+    private void udpStream(DatagramSocket d) throws IOException {
+        // single buffer reused every packet — avoids per-frame allocation at 25-30 fps
+        byte[] buf = new byte[65535];
+        DatagramPacket packet = new DatagramPacket(buf, buf.length);
         while (activeStream) {
-            byte[] data = new byte[65535]; // max UDP payload size
-            DatagramPacket packet = new DatagramPacket(data, data.length);
             d.receive(packet);
             processPacket(new Frame(packet.getData(), packet.getLength()));
         }
     }
 
-    private void tcp_stream(InputStream input) throws IOException {
+    private void tcpStream(InputStream input) throws IOException {
+        // single read buffer reused for every RTSP interleaved packet
+        byte[] pktBuf = new byte[65535];
         while (activeStream) {
             int b = input.read();
             if (b == -1) break;      // server closed the connection
@@ -723,16 +735,15 @@ public class Decoder extends Activity {
             if (channel == -1 || hi == -1 || lo == -1) break; // unexpected EOF in header
             int len = (hi << 8) | lo;
 
-            byte[] data = new byte[len];
             int read = 0;
             while (read < len) {
-                int n = input.read(data, read, len - read);
+                int n = input.read(pktBuf, read, len - read);
                 if (n == -1) throw new IOException("stream truncated mid-packet");
                 read += n;
             }
 
             if (channel == 0 || channel == 2) {
-                processPacket(new Frame(data, len));
+                processPacket(new Frame(pktBuf, len));
             }
         }
     }
@@ -756,7 +767,11 @@ public class Decoder extends Activity {
             Frame output = buildFrame(frame);
             if (output != null) {
                 try {
-                    nalQueue.put(output);
+                    // offer() with timeout mirrors the same pattern used for pcmQueue;
+                    // avoids blocking the network thread when the video decoder stalls
+                    if (!nalQueue.offer(output, 200, TimeUnit.MILLISECONDS)) {
+                        Log.w(TAG, "Video queue full, frame dropped");
+                    }
                 } catch (InterruptedException e) {
                     Log.w(TAG, "Video thread interrupted");
                 }
@@ -784,7 +799,7 @@ public class Decoder extends Activity {
                             mSurface.setVisibility(View.VISIBLE);
                             mConnect.setVisibility(View.VISIBLE);
                         });
-                        rtsp_connect();
+                        rtspConnect();
                     }
                 } catch (Exception e) {
                     Log.w(TAG, "Cannot connect rtsp: " + e.getMessage());
@@ -841,6 +856,9 @@ public class Decoder extends Activity {
             activeStream = false;
             closeDecoder();
             closeAudio();
+            // discard stale frames so the new session starts with a clean slate
+            nalQueue.clear();
+            pcmQueue.clear();
         }
     }
 
