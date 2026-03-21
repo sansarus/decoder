@@ -22,6 +22,7 @@ import android.media.AudioTrack;
 import android.media.MediaCodec;
 import android.media.MediaFormat;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.SystemClock;
 import android.text.InputType;
@@ -37,6 +38,8 @@ import android.view.Surface;
 import android.view.SurfaceView;
 import android.view.View;
 import android.view.Window;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.view.inputmethod.EditorInfo;
 import android.webkit.HttpAuthHandler;
@@ -87,8 +90,9 @@ public class Decoder extends Activity {
     // lifecycle can detect they are stale and exit their loops
     private volatile int listenerGen;
 
-    private String mHost;
-    private boolean mType;
+    // read from the network thread, written from the UI thread
+    private volatile String mHost;
+    private volatile boolean mType;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -101,7 +105,18 @@ public class Decoder extends Activity {
         mConnect.setTextColor(Color.LTGRAY);
 
         codecH265 = true;
-        getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_HIDE_NAVIGATION);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            WindowInsetsController ctrl = getWindow().getInsetsController();
+            if (ctrl != null) {
+                ctrl.hide(WindowInsets.Type.navigationBars());
+                ctrl.setSystemBarsBehavior(
+                        WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+            }
+        } else {
+            //noinspection deprecation
+            getWindow().getDecorView().setSystemUiVisibility(
+                    View.SYSTEM_UI_FLAG_HIDE_NAVIGATION);
+        }
 
         View menu = findViewById(R.id.decoder);
         menu.setOnClickListener(item -> createMenu(menu));
@@ -124,7 +139,7 @@ public class Decoder extends Activity {
 
         String link = getIntent().getStringExtra(Intent.EXTRA_TEXT);
         if (link != null) {
-            Log.d(TAG, "Link: " + link);
+            Log.d(TAG, "Link: " + Uri.parse(link).getHost()); // host only, never credentials
             mHost = link;
         }
     }
@@ -269,9 +284,16 @@ public class Decoder extends Activity {
         dialog.setContentView(view);
         dialog.setCanceledOnTouchOutside(true);
 
-        DisplayMetrics displayMetrics = new DisplayMetrics();
-        getWindowManager().getDefaultDisplay().getMetrics(displayMetrics);
-        int screenWidth = (int) (displayMetrics.widthPixels * 0.75);
+        int screenWidth;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            screenWidth = (int) (getWindowManager().getCurrentWindowMetrics()
+                    .getBounds().width() * 0.75);
+        } else {
+            //noinspection deprecation
+            DisplayMetrics dm = new DisplayMetrics();
+            getWindowManager().getDefaultDisplay().getMetrics(dm);
+            screenWidth = (int) (dm.widthPixels * 0.75);
+        }
         if (dialog.getWindow() != null) {
             dialog.getWindow().setLayout(screenWidth, WindowManager.LayoutParams.MATCH_PARENT);
         }
@@ -287,14 +309,15 @@ public class Decoder extends Activity {
             return;
         }
 
-        int lastH = mSurface.getHeight();
-        int lastW = (int) ((float) lastH / height * width);
-        Log.d(TAG, "Set resolution: " + width + "x" + height + " -> " + lastW + "x" + lastH);
+        int surfaceH = mSurface.getHeight();
+        // surface may not be measured yet on the first decoded frame — fall back to display height
+        if (surfaceH == 0) surfaceH = getResources().getDisplayMetrics().heightPixels;
+        int surfaceW = (int) ((float) surfaceH / height * width);
+        Log.d(TAG, "Set resolution: " + width + "x" + height + " -> " + surfaceW + "x" + surfaceH);
 
+        final int w = surfaceW, h = surfaceH;
         runOnUiThread(() -> {
-            FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(lastW, lastH);
-            params.width = lastW;
-            params.height = lastH;
+            FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(w, h);
             params.gravity = Gravity.CENTER;
             findViewById(R.id.video_surface).setLayoutParams(params);
             mConnect.setVisibility(View.GONE);
@@ -414,6 +437,9 @@ public class Decoder extends Activity {
     private void processAudio(Frame frame) {
         int header = 12;
         int length = frame.length() - header;
+        if (length <= 0) {  // ignore malformed packets shorter than the RTP header
+            return;
+        }
 
         byte[] data = new byte[length];
         System.arraycopy(frame.data(), header, data, 0, length);
@@ -427,7 +453,7 @@ public class Decoder extends Activity {
         try {
             pcmQueue.put(buffer);
         } catch (InterruptedException e) {
-            Log.w(TAG, "Audio queue is full");
+            Log.w(TAG, "Audio thread interrupted");
         }
     }
 
@@ -437,6 +463,10 @@ public class Decoder extends Activity {
 
         Log.d(TAG, "Create audio decoder (" + sample + "hz)");
         int size = AudioTrack.getMinBufferSize(sample, format, AudioFormat.ENCODING_PCM_16BIT);
+        if (size <= 0) {  // ERROR (-1) or ERROR_BAD_VALUE (-2): unsupported sample rate
+            Log.e(TAG, "Invalid audio parameters: sample=" + sample + " bufSize=" + size);
+            return;
+        }
         audioTrack = new AudioTrack(AudioManager.STREAM_MUSIC, sample, format,
                 AudioFormat.ENCODING_PCM_16BIT, size, AudioTrack.MODE_STREAM);
         audioTrack.play();
@@ -610,6 +640,8 @@ public class Decoder extends Activity {
                 Log.i(TAG, line);
             }
 
+            // disable read timeout before streaming: keyframe intervals often exceed 1 second
+            s.setSoTimeout(0);
             activeStream = true;
             if (mType) {
                 try (DatagramSocket d = new DatagramSocket(5000)) {
@@ -679,7 +711,7 @@ public class Decoder extends Activity {
                 try {
                     nalQueue.put(output);
                 } catch (InterruptedException e) {
-                    Log.w(TAG, "Frame queue is full");
+                    Log.w(TAG, "Video thread interrupted");
                 }
             }
 
