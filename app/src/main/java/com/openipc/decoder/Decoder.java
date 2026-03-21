@@ -687,6 +687,10 @@ public class Decoder extends Activity {
         }
 
         mDecoder = local;
+        // reset the watchdog baseline: decodeFrame() only updates lastFrame after the codec
+        // is ready, so the first call (codec==null path) returns early without touching it.
+        // Without this, a keyframe interval > 3s would trigger a spurious stream disconnect.
+        lastFrame = SystemClock.elapsedRealtime();
         updateResolution(lastWidth, lastHeight);
     }
 
