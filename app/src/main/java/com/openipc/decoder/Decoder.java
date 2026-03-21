@@ -81,7 +81,7 @@ public class Decoder extends Activity {
     private TextView mConnect;
 
     private volatile boolean codecH265;
-    private volatile boolean lastCodec;
+    private boolean lastCodec; // only accessed on the network thread — volatile not needed
     private volatile boolean listener;
     private volatile boolean activeStream;
     private volatile int lastWidth;
@@ -122,17 +122,24 @@ public class Decoder extends Activity {
     private static final int RTP_FU_H265  = 49;  // H.265 FU
 
     // RTP dynamic payload types as negotiated in the OpenIPC camera SDP
-    private static final int RTP_PT_PCMU  = 100; // G.711 μ-law audio
+    private static final int RTP_PT_PCMU  = 100; // audio (dynamic, typically 16-bit PCM)
     private static final int RTP_PT_AAC   = 99;  // AAC audio (unsupported)
     private static final int RTP_PT_OPUS  = 98;  // Opus audio (unsupported)
     private static final int RTP_PT_H265  = 97;  // H.265/HEVC video
     private static final int RTP_PT_H264  = 96;  // H.264/AVC video
 
+    // Parameter-set NAL types used to set BUFFER_FLAG_CODEC_CONFIG on the decoder input
+    private static final int H265_NAL_VPS = 32;  // Video Parameter Set
+    private static final int H265_NAL_SPS = 33;  // Sequence Parameter Set
+    private static final int H265_NAL_PPS = 34;  // Picture Parameter Set
+    private static final int H264_NAL_SPS = 7;
+    private static final int H264_NAL_PPS = 8;
+
     // inactivity threshold: reconnect if no RTP frame arrives within this period
     private static final long WATCHDOG_MS  = 3000;
 
-    // camera streams audio at 25 fps; sample rate = frame_bytes * frames_per_sec
-    private static final int AUDIO_FRAMES_PER_SEC = 25;
+    // audio clock rate parsed from SDP rtpmap; falls back to 8000 Hz if SDP is absent
+    private volatile int audioSampleRate = 8000;
 
     // reference kept so we can dismiss the dialog (and destroy the WebView) on rotation
     private volatile Dialog mBrowserDialog;
@@ -596,14 +603,13 @@ public class Decoder extends Activity {
     }
 
     private void createAudio(int length) {
-        // Guard against integer overflow: length must be a sane PCM frame size.
-        // Typical G.711 frame at 8000 Hz / 25 fps = 320 bytes.
-        if (length <= 0 || length > 48000) {
-            Log.e(TAG, "Implausible audio frame length: " + length);
+        if (length <= 0) {
+            Log.e(TAG, "Invalid audio frame length: " + length);
             audioFailed = true;
             return;
         }
-        int sample = length * AUDIO_FRAMES_PER_SEC;
+        // use the clock rate extracted from SDP; falls back to the 8000 Hz default
+        int sample = audioSampleRate;
         int format = AudioFormat.CHANNEL_OUT_MONO;
 
         Log.d(TAG, "Create audio decoder (" + sample + "hz)");
@@ -674,7 +680,11 @@ public class Decoder extends Activity {
 
         int flag = 0;
         int fragment = getFragment(buffer.data()[4]);
-        if (fragment == 32 || fragment == 33 || fragment == 34) {
+        // mark parameter-set NALs so the decoder can configure itself before the first frame
+        boolean isConfigNal = codecH265
+                ? (fragment == H265_NAL_VPS || fragment == H265_NAL_SPS || fragment == H265_NAL_PPS)
+                : (fragment == H264_NAL_SPS || fragment == H264_NAL_PPS);
+        if (isConfigNal) {
             flag = MediaCodec.BUFFER_FLAG_CODEC_CONFIG;
         }
 
@@ -780,7 +790,10 @@ public class Decoder extends Activity {
         int c;
         while ((c = in.read()) != -1) {
             if (c == '\n') return sb.toString();
-            if (c != '\r') sb.append((char) c);
+            if (c != '\r') {
+                if (sb.length() >= 8192) throw new IOException("RTSP header line too long");
+                sb.append((char) c);
+            }
         }
         return sb.length() > 0 ? sb.toString() : null;
     }
@@ -818,6 +831,32 @@ public class Decoder extends Activity {
             }
         }
         return found;
+    }
+
+    /**
+     * Extracts the audio clock rate from an SDP body.
+     * Looks for "a=rtpmap:<RTP_PT_PCMU> <encoding>/<clock_rate>[/<channels>]"
+     * and stores the result in {@link #audioSampleRate}.
+     */
+    private void parseSdpAudioRate(String sdp) {
+        String prefix = "a=rtpmap:" + RTP_PT_PCMU + " ";
+        for (String line : sdp.split("[\r\n]+")) {
+            if (line.startsWith(prefix)) {
+                int slash = line.indexOf('/', prefix.length());
+                if (slash >= 0) {
+                    int end = line.indexOf('/', slash + 1);
+                    String rateStr = (end >= 0 ? line.substring(slash + 1, end) : line.substring(slash + 1)).trim();
+                    try {
+                        int rate = Integer.parseInt(rateStr);
+                        if (rate > 0 && rate <= 192000) {
+                            audioSampleRate = rate;
+                            Log.d(TAG, "Audio sample rate from SDP: " + rate + " Hz");
+                        }
+                    } catch (NumberFormatException ignored) {}
+                }
+                break;
+            }
+        }
     }
 
     private void rtspConnect() throws Exception {
@@ -858,13 +897,17 @@ public class Decoder extends Activity {
                 try { sdpBodyLen = Integer.parseInt(contentLenStr); }
                 catch (NumberFormatException ignored) {}
             }
-            // consume SDP body so it does not pollute the SETUP response
+            // read SDP body; parse audio clock rate, then discard the rest
+            StringBuilder sdp = new StringBuilder();
             byte[] skipBuf = new byte[512];
             while (sdpBodyLen > 0) {
                 int n = input.read(skipBuf, 0, Math.min(sdpBodyLen, skipBuf.length));
                 if (n <= 0) break; // -1 = EOF; 0 = legal but unusual, avoids infinite loop
+                if (sdp.length() < 4096) // cap to avoid OOM on pathological responses
+                    sdp.append(new String(skipBuf, 0, n, StandardCharsets.UTF_8));
                 sdpBodyLen -= n;
             }
+            parseSdpAudioRate(sdp.toString());
 
             seq++;
             String type = mType ? "RTP/AVP/UDP;unicast;client_port=5000"
@@ -879,6 +922,8 @@ public class Decoder extends Activity {
             if (session == null) {
                 throw new IOException("RTSP server did not return a Session header");
             }
+            // strip CR/LF to prevent the session token from injecting extra RTSP headers
+            session = session.replaceAll("[\r\n]", "");
 
             seq++;
             type = mType ? "RTP/AVP/UDP;unicast;client_port=5002"
