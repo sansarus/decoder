@@ -83,6 +83,10 @@ public class Decoder extends Activity {
     private volatile int lastHeight;
     private volatile long lastFrame;
 
+    // incremented in onPause so that orphaned threads from the previous
+    // lifecycle can detect they are stale and exit their loops
+    private volatile int listenerGen;
+
     private String mHost;
     private boolean mType;
 
@@ -240,12 +244,24 @@ public class Decoder extends Activity {
     @SuppressLint("SetJavaScriptEnabled")
     private void startBrowser() {
         WebView view = new WebView(this);
-        view.setWebViewClient(new WebViewClient());
         view.getSettings().setJavaScriptEnabled(true);
         String link = Uri.parse(mHost).getHost();
-        if (link != null) {
-            view.loadUrl("http://" + link);
-        }
+
+        // Set the auth-capable client BEFORE loadUrl so credentials are
+        // available on the very first HTTP 401 challenge.
+        view.setWebViewClient(new WebViewClient() {
+            @Override
+            public void onReceivedHttpAuthRequest(
+                    WebView view, HttpAuthHandler handler, String host, String realm) {
+                String mUser = Uri.parse(mHost).getUserInfo();
+                if (mUser != null) {
+                    String[] part = mUser.split(":", 2);
+                    if (part.length > 1) {
+                        handler.proceed(part[0], part[1]);
+                    }
+                }
+            }
+        });
 
         Log.d(TAG, "WebView: " + link);
         Dialog dialog = new Dialog(this);
@@ -261,23 +277,13 @@ public class Decoder extends Activity {
         }
         dialog.show();
 
-        view.setWebViewClient(new WebViewClient() {
-            @Override
-            public void onReceivedHttpAuthRequest(
-                    WebView view, HttpAuthHandler handler, String host, String realm) {
-                String mUser = Uri.parse(mHost).getUserInfo();
-                if (mUser != null) {
-                    String[] part = mUser.split(":", 2);
-                    if (part.length > 1) {
-                        handler.proceed(part[0], part[1]);
-                    }
-                }
-            }
-        });
+        if (link != null) {
+            view.loadUrl("http://" + link);
+        }
     }
 
     private void updateResolution(int width, int height) {
-        if (lastWidth < 64 || lastHeight < 64) {
+        if (width < 64 || height < 64) {  // validate incoming params to avoid division by zero
             return;
         }
 
@@ -305,6 +311,11 @@ public class Decoder extends Activity {
         int cpSize = 12;
         rxSize -= cpSize;
 
+        if (rxSize <= 0) {  // packet must have at least 1 byte of RTP payload
+            Log.w(TAG, "RTP payload too short: " + frame.length());
+            return null;
+        }
+
         int staBit;
         int endBit;
         int nalBit = 4;
@@ -317,6 +328,13 @@ public class Decoder extends Activity {
 
         int fragment = getFragment(rxBuffer[cpSize]);
         if (fragment == 28 || fragment == 49) {
+            // fragmented NAL: H.265 FU needs 3 bytes header, H.264 FU-A needs 2
+            int minPayload = codecH265 ? 3 : 2;
+            if (rxSize < minPayload) {
+                Log.w(TAG, "FU header too short: " + rxSize);
+                return null;
+            }
+
             if (codecH265) {
                 staBit = rxBuffer[cpSize + 2] & 0x80;
                 endBit = rxBuffer[cpSize + 2] & 0x40;
@@ -343,12 +361,22 @@ public class Decoder extends Activity {
                 nalBuffer[2] = 0;
                 nalBuffer[3] = 1;
 
+                if (nalBit + rxSize > nalBuffer.length) {  // guard: start fragment overflow
+                    Log.e(TAG, "NAL start fragment too large, dropping");
+                    nalSize = 0;
+                    return null;
+                }
                 System.arraycopy(rxBuffer, cpSize, nalBuffer, nalBit, rxSize);
                 nalSize = rxSize + nalBit;
             } else {
                 cpSize++;
                 rxSize--;
 
+                if (nalSize + rxSize > nalBuffer.length) {  // guard: accumulated overflow
+                    Log.e(TAG, "NAL buffer overflow, dropping frame");
+                    nalSize = 0;
+                    return null;
+                }
                 System.arraycopy(rxBuffer, cpSize, nalBuffer, nalSize, rxSize);
                 nalSize += rxSize;
 
@@ -629,6 +657,10 @@ public class Decoder extends Activity {
     }
 
     private void processPacket(Frame frame) {
+        if (frame.length() < 2) {  // need at least 2 bytes to read the payload type
+            Log.w(TAG, "RTP packet too short: " + frame.length());
+            return;
+        }
         byte[] data = frame.data();
         int payload = (data[1] & 0x7F);
         if (payload == 100) {
@@ -659,8 +691,13 @@ public class Decoder extends Activity {
 
     private void startListener() {
         Log.i(TAG, "Start network listener");
+
+        // Each thread captures its generation; exits as soon as onPause
+        // increments listenerGen, preventing duplicate threads on resume.
+        final int gen = listenerGen;
+
         new Thread(() -> {
-            while (listener) {
+            while (gen == listenerGen) {
                 try {
                     if (!activeStream) {
                         runOnUiThread(() -> {
@@ -675,10 +712,10 @@ public class Decoder extends Activity {
                     SystemClock.sleep(1000);
                 }
             }
-        }).start();
+        }, "rtsp-network").start();
 
         new Thread(() -> {
-            while (listener) {
+            while (gen == listenerGen) {
                 if (activeStream) {
                     if (SystemClock.elapsedRealtime() - lastFrame > 3000) {
                         Log.w(TAG, "Stream is inactive");
@@ -687,10 +724,10 @@ public class Decoder extends Activity {
                 }
                 SystemClock.sleep(1000);
             }
-        }).start();
+        }, "rtsp-watchdog").start();
 
         new Thread(() -> {
-            while (listener) {
+            while (gen == listenerGen) {
                 try {
                     Frame buffer = nalQueue.poll(5, TimeUnit.MILLISECONDS);
                     if (buffer != null) {
@@ -700,10 +737,10 @@ public class Decoder extends Activity {
                     Log.w(TAG, "Cannot decode video: " + e.getMessage());
                 }
             }
-        }).start();
+        }, "rtsp-video").start();
 
         new Thread(() -> {
-            while (listener) {
+            while (gen == listenerGen) {
                 try {
                     Frame buffer = pcmQueue.poll(5, TimeUnit.MILLISECONDS);
                     if (buffer != null) {
@@ -713,13 +750,14 @@ public class Decoder extends Activity {
                     Log.w(TAG, "Cannot decode audio: " + e.getMessage());
                 }
             }
-        }).start();
+        }, "rtsp-audio").start();
     }
 
     @Override
     protected void onPause() {
         super.onPause();
         if (listener) {
+            listenerGen++;  // invalidate all threads from the current generation
             listener = false;
             activeStream = false;
             closeDecoder();
