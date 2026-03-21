@@ -560,17 +560,22 @@ public class Decoder extends Activity {
             audioFailed = true;
             return;
         }
-        audioTrack = new AudioTrack(AudioManager.STREAM_MUSIC, sample, format,
+
+        // build into a local first: assigning to the volatile field immediately would expose
+        // a partially-initialised AudioTrack to onPause() → closeAudio() on the UI thread
+        AudioTrack track = new AudioTrack(AudioManager.STREAM_MUSIC, sample, format,
                 AudioFormat.ENCODING_PCM_16BIT, size, AudioTrack.MODE_STREAM);
-        if (audioTrack.getState() != AudioTrack.STATE_INITIALIZED) {
+        if (track.getState() != AudioTrack.STATE_INITIALIZED) {
             // resource exhaustion or invalid config at the OS audio layer
             Log.e(TAG, "AudioTrack failed to initialize, releasing");
-            audioTrack.release();
-            audioTrack = null;
+            track.release();
             audioFailed = true;
             return;
         }
-        audioTrack.play();
+
+        // publish to the volatile field only after the track is fully ready
+        audioTrack = track;
+        track.play();
     }
 
     private void closeAudio() {
@@ -792,7 +797,7 @@ public class Decoder extends Activity {
             byte[] skipBuf = new byte[512];
             while (sdpBodyLen > 0) {
                 int n = input.read(skipBuf, 0, Math.min(sdpBodyLen, skipBuf.length));
-                if (n == -1) break;
+                if (n <= 0) break; // -1 = EOF; 0 = legal but unusual, avoids infinite loop
                 sdpBodyLen -= n;
             }
 
