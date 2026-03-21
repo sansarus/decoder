@@ -27,9 +27,9 @@ android {
             storeFile file("../key.jks")
             // Credentials are read from environment variables — never hardcode secrets in VCS.
             // Set KEYSTORE_PASS, KEY_ALIAS and KEY_PASS before running the release build.
-            storePassword System.getenv("KEYSTORE_PASS") ?: "release"
-            keyAlias    System.getenv("KEY_ALIAS")    ?: "key"
-            keyPassword System.getenv("KEY_PASS")     ?: "release"
+            storePassword System.getenv("KEYSTORE_PASS") ?: error("KEYSTORE_PASS env var not set")
+            keyAlias    System.getenv("KEY_ALIAS")    ?: error("KEY_ALIAS env var not set")
+            keyPassword System.getenv("KEY_PASS")     ?: error("KEY_PASS env var not set")
         }
     }
 

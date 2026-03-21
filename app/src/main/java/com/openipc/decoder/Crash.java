@@ -24,7 +24,8 @@ public class Crash extends Activity {
         errorView.setTextColor(Color.RED);
         errorView.setPadding(24, 12, 24, 12);
 
-        String error = getIntent().getStringExtra("error");
+        Intent intent = getIntent();
+        String error = (intent != null) ? intent.getStringExtra("error") : null;
         errorView.setText(error != null ? error : "Unknown error");
 
         ScrollView scrollView = new ScrollView(this);

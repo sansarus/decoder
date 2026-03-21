@@ -121,8 +121,18 @@ public class Decoder extends Activity {
     private static final int RTP_FU_H264  = 28;  // H.264 FU-A
     private static final int RTP_FU_H265  = 49;  // H.265 FU
 
+    // RTP dynamic payload types as negotiated in the OpenIPC camera SDP
+    private static final int RTP_PT_PCMU  = 100; // G.711 μ-law audio
+    private static final int RTP_PT_AAC   = 99;  // AAC audio (unsupported)
+    private static final int RTP_PT_OPUS  = 98;  // Opus audio (unsupported)
+    private static final int RTP_PT_H265  = 97;  // H.265/HEVC video
+    private static final int RTP_PT_H264  = 96;  // H.264/AVC video
+
     // inactivity threshold: reconnect if no RTP frame arrives within this period
     private static final long WATCHDOG_MS  = 3000;
+
+    // camera streams audio at 25 fps; sample rate = frame_bytes * frames_per_sec
+    private static final int AUDIO_FRAMES_PER_SEC = 25;
 
     // reference kept so we can dismiss the dialog (and destroy the WebView) on rotation
     private volatile Dialog mBrowserDialog;
@@ -534,12 +544,15 @@ public class Decoder extends Activity {
             }
         } else {
             // write() may return a positive number less than the requested length;
-            // loop until all bytes are consumed or a fatal error is reported
+            // loop until all bytes are consumed or a fatal error is reported.
+            // Re-snapshot audioTrack on each iteration: closeAudio() can null it at any moment.
             byte[] buf = data.data();
             int offset = 0;
             int remaining = data.length();
             while (remaining > 0) {
-                int written = track.write(buf, offset, remaining);
+                AudioTrack t = audioTrack; // re-check: UI thread may have called closeAudio()
+                if (t == null) break;
+                int written = t.write(buf, offset, remaining);
                 if (written < 0) {
                     Log.e(TAG, "AudioTrack.write() error: " + written);
                     break;
@@ -583,7 +596,14 @@ public class Decoder extends Activity {
     }
 
     private void createAudio(int length) {
-        int sample = length * 25;
+        // Guard against integer overflow: length must be a sane PCM frame size.
+        // Typical G.711 frame at 8000 Hz / 25 fps = 320 bytes.
+        if (length <= 0 || length > 48000) {
+            Log.e(TAG, "Implausible audio frame length: " + length);
+            audioFailed = true;
+            return;
+        }
+        int sample = length * AUDIO_FRAMES_PER_SEC;
         int format = AudioFormat.CHANNEL_OUT_MONO;
 
         Log.d(TAG, "Create audio decoder (" + sample + "hz)");
@@ -608,7 +628,15 @@ public class Decoder extends Activity {
 
         // publish to the volatile field only after the track is fully ready
         audioTrack = track;
-        track.play();
+        try {
+            track.play();
+        } catch (Exception e) {
+            // play() can throw on resource exhaustion; release to avoid a native-handle leak
+            audioTrack = null;
+            track.release();
+            Log.e(TAG, "AudioTrack.play() failed", e);
+            audioFailed = true;
+        }
     }
 
     private void closeAudio() {
@@ -941,6 +969,12 @@ public class Decoder extends Activity {
             int lo = input.read();
             if (channel == -1 || hi == -1 || lo == -1) break; // unexpected EOF in header
             int len = (hi << 8) | lo;
+            // A zero-length or oversized packet is malformed; skip it to avoid
+            // an empty read loop or an out-of-bounds access into pktBuf.
+            if (len <= 0 || len > pktBuf.length) {
+                Log.w(TAG, "Invalid RTSP interleaved packet length: " + len);
+                continue;
+            }
 
             int read = 0;
             while (read < len) {
@@ -956,21 +990,21 @@ public class Decoder extends Activity {
     }
 
     private void processPacket(Frame frame) {
-        if (frame.length() < 2) {  // need at least 2 bytes to read the payload type
+        if (frame.length() < 12) {  // RTP fixed header is exactly 12 bytes
             Log.w(TAG, "RTP packet too short: " + frame.length());
             return;
         }
         byte[] data = frame.data();
         int payload = (data[1] & 0x7F);
-        if (payload == 100) {
+        if (payload == RTP_PT_PCMU) {
             processAudio(frame);
             return;
-        } else if (payload == 99) {
+        } else if (payload == RTP_PT_AAC) {
             return; // AAC not supported
-        } else if (payload == 98) {
+        } else if (payload == RTP_PT_OPUS) {
             return; // Opus not supported
-        } else if (payload == 97 || payload == 96) {
-            codecH265 = payload == 97;
+        } else if (payload == RTP_PT_H265 || payload == RTP_PT_H264) {
+            codecH265 = payload == RTP_PT_H265;
             Frame output = buildFrame(frame);
             if (output != null) {
                 try {
@@ -1003,19 +1037,18 @@ public class Decoder extends Activity {
         final int gen = listenerGen;
 
         new Thread(() -> {
+            int retryDelay = 1000; // start at 1 s, doubles up to 8 s on repeated failures
             while (gen == listenerGen) {
                 try {
                     if (!activeStream) {
-                        runOnUiThread(() -> {
-                            mSurface.setVisibility(View.GONE);
-                            mSurface.setVisibility(View.VISIBLE);
-                            mConnect.setVisibility(View.VISIBLE);
-                        });
+                        runOnUiThread(() -> mConnect.setVisibility(View.VISIBLE));
                         rtspConnect();
+                        retryDelay = 1000; // reset on successful connection
                     }
                 } catch (Exception e) {
                     Log.w(TAG, "Cannot connect rtsp: " + e.getMessage());
-                    SystemClock.sleep(1000);
+                    SystemClock.sleep(retryDelay);
+                    retryDelay = Math.min(retryDelay * 2, 8000);
                 }
             }
         }, "rtsp-network").start();
