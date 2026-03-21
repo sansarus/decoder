@@ -405,7 +405,10 @@ public class Decoder extends Activity {
 
         if (lastCodec != codecH265) {
             lastCodec = codecH265;
-            nalSize = 0; // discard any partial NAL fragment from the previous codec
+            nalSize = 0;   // discard partial NAL fragment from the previous codec
+            nalQueue.clear(); // discard fully-assembled frames from the previous codec —
+                              // feeding H.264 frames to an H.265 decoder (or vice versa)
+                              // causes decoding errors and visual corruption
             closeDecoder();
             Log.d(TAG, "Set codec to " + (codecH265 ? "H265" : "H264"));
         }
