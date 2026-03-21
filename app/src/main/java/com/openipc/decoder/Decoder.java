@@ -117,6 +117,16 @@ public class Decoder extends Activity {
     // tracks last warned unknown RTP payload type to suppress log spam on the network thread
     private volatile int lastUnknownPayload = -1;
 
+    // RTP fragmentation unit NAL types
+    private static final int RTP_FU_H264  = 28;  // H.264 FU-A
+    private static final int RTP_FU_H265  = 49;  // H.265 FU
+
+    // inactivity threshold: reconnect if no RTP frame arrives within this period
+    private static final long WATCHDOG_MS  = 3000;
+
+    // reference kept so we can dismiss the dialog (and destroy the WebView) on rotation
+    private volatile Dialog mBrowserDialog;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -164,9 +174,13 @@ public class Decoder extends Activity {
         String link = getIntent().getStringExtra(Intent.EXTRA_TEXT);
         if (link != null) {
             Log.d(TAG, "Link: " + Uri.parse(link).getHost()); // host only, never credentials
-            mHost = link;
+            mHost = sanitizeUrl(link);
         }
     }
+
+    /** Strip CR/LF to prevent CRLF injection into RTSP header lines. */
+    private static String sanitizeUrl(String url) {
+        return url.replaceAll("[\r\n]", "");
 
     private void saveSettings() {
         SharedPreferences pref = getSharedPreferences("settings", MODE_PRIVATE);
@@ -205,7 +219,7 @@ public class Decoder extends Activity {
         header.addView(host);
         host.setOnEditorActionListener((v, actionId, event) -> {
             if (actionId == EditorInfo.IME_ACTION_DONE) {
-                mHost = host.getText().toString().trim();
+                mHost = sanitizeUrl(host.getText().toString().trim());
                 saveSettings();
                 popup.dismiss();
                 return true;
@@ -360,6 +374,7 @@ public class Decoder extends Activity {
         dialog.show();
         // release WebView native resources when the dialog is dismissed
         dialog.setOnDismissListener(d -> view.destroy());
+        mBrowserDialog = dialog;
 
         view.loadUrl("http://" + link);
     }
@@ -414,7 +429,7 @@ public class Decoder extends Activity {
         }
 
         int fragment = getFragment(rxBuffer[cpSize]);
-        if (fragment == 28 || fragment == 49) {
+        if (fragment == RTP_FU_H264 || fragment == RTP_FU_H265) {
             // fragmented NAL: H.265 FU needs 3 bytes header, H.264 FU-A needs 2
             int minPayload = codecH265 ? 3 : 2;
             if (rxSize < minPayload) {
@@ -505,10 +520,8 @@ public class Decoder extends Activity {
             return new Frame(output, nalSize);
         }
 
-        return null;
-    }
-
-    private void playAudio(Frame data) {
+        // middle fragment: accumulating, frame not yet complete
+        return null;(Frame data) {
         // snapshot to a local: onPause() can null audioTrack from the UI thread at any moment
         AudioTrack track = audioTrack;
         if (track == null) {
@@ -516,7 +529,20 @@ public class Decoder extends Activity {
                 createAudio(data.length());
             }
         } else {
-            track.write(data.data(), 0, data.length());
+            // write() may return a positive number less than the requested length;
+            // loop until all bytes are consumed or a fatal error is reported
+            byte[] buf = data.data();
+            int offset = 0;
+            int remaining = data.length();
+            while (remaining > 0) {
+                int written = track.write(buf, offset, remaining);
+                if (written < 0) {
+                    Log.e(TAG, "AudioTrack.write() error: " + written);
+                    break;
+                }
+                offset    += written;
+                remaining -= written;
+            }
         }
     }
 
@@ -993,7 +1019,7 @@ public class Decoder extends Activity {
         new Thread(() -> {
             while (gen == listenerGen) {
                 if (activeStream) {
-                    if (SystemClock.elapsedRealtime() - lastFrame > 3000) {
+                    if (SystemClock.elapsedRealtime() - lastFrame > WATCHDOG_MS) {
                         Log.w(TAG, "Stream is inactive");
                         activeStream = false;
                         // close the TCP socket so input.read() unblocks immediately —
@@ -1043,6 +1069,11 @@ public class Decoder extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
+        // dismiss any open browser dialog; its OnDismissListener will call view.destroy()
+        // preventing a WebView native-resource leak when the Activity is rotated
+        Dialog browser = mBrowserDialog;
+        mBrowserDialog = null;
+        if (browser != null && browser.isShowing()) browser.dismiss();
         if (listener) {
             listenerGen++;  // invalidate all threads from the current generation
             listener = false;
