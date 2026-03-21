@@ -105,6 +105,11 @@ public class Decoder extends Activity {
     // pre-allocated to avoid per-frame GC pressure in the video decode loop
     private final MediaCodec.BufferInfo mBufferInfo = new MediaCodec.BufferInfo();
 
+    // pre-allocated audio staging buffer: PCM frames are at most a few KB;
+    // if a frame exceeds this size we fall back to a one-time heap allocation
+    private static final int PCM_BUF_SIZE = 8192;
+    private final byte[] pcmStagingBuf = new byte[PCM_BUF_SIZE];
+
     // read from the network thread, written from the UI thread
     private volatile String mHost;
     private volatile boolean mType;
@@ -500,12 +505,14 @@ public class Decoder extends Activity {
     }
 
     private void playAudio(Frame data) {
-        if (audioTrack == null) {
+        // snapshot to a local: onPause() can null audioTrack from the UI thread at any moment
+        AudioTrack track = audioTrack;
+        if (track == null) {
             if (!audioFailed) {  // skip retry if init already failed for this session
                 createAudio(data.length());
             }
         } else {
-            audioTrack.write(data.data(), 0, data.length());
+            track.write(data.data(), 0, data.length());
         }
     }
 
@@ -516,7 +523,9 @@ public class Decoder extends Activity {
             return;
         }
 
-        byte[] data = new byte[length];
+        // reuse pre-allocated staging buffer for typical PCM frame sizes to reduce GC pressure;
+        // fall back to heap allocation only for unusually large frames
+        byte[] data = (length <= PCM_BUF_SIZE) ? pcmStagingBuf : new byte[length];
         System.arraycopy(frame.data(), header, data, 0, length);
         for (int i = 0; i + 1 < length; i += 2) { // guard against odd-length frames
             byte tmp = data[i];
@@ -524,7 +533,9 @@ public class Decoder extends Activity {
             data[i + 1] = tmp;
         }
 
-        Frame buffer = new Frame(data, length);
+        // must copy into a fresh array before queuing — pcmStagingBuf is overwritten next call
+        byte[] queued = (data == pcmStagingBuf) ? java.util.Arrays.copyOf(data, length) : data;
+        Frame buffer = new Frame(queued, length);
         try {
             // offer() with a timeout to avoid blocking the network thread when
             // the audio consumer stalls; drop the frame if the queue stays full
@@ -532,7 +543,8 @@ public class Decoder extends Activity {
                 Log.w(TAG, "Audio queue full, frame dropped");
             }
         } catch (InterruptedException e) {
-            Log.w(TAG, "Audio thread interrupted");
+            Thread.currentThread().interrupt(); // restore interrupt status for the caller
+            Log.w(TAG, "Audio queue interrupted");
         }
     }
 
@@ -571,8 +583,16 @@ public class Decoder extends Activity {
     }
 
     private void decodeFrame(Frame buffer) {
-        if (mDecoder == null) {
+        // snapshot to a local: onPause() can null mDecoder from the UI thread at any moment,
+        // and a volatile read between null-check and method call would be a TOCTOU race
+        MediaCodec codec = mDecoder;
+        if (codec == null) {
             if (!decoderFailed) createDecoder(); // skip if codec proved unsupported
+            return;
+        }
+
+        if (buffer.length() < 5) { // need at least 4-byte start code + 1 NAL type byte
+            Log.w(TAG, "NAL frame too short: " + buffer.length());
             return;
         }
 
@@ -585,22 +605,22 @@ public class Decoder extends Activity {
         }
 
         try {
-            int inputBufferId = mDecoder.dequeueInputBuffer(0);
+            int inputBufferId = codec.dequeueInputBuffer(0);
             if (inputBufferId >= 0) {
-                ByteBuffer inputBuffer = mDecoder.getInputBuffer(inputBufferId);
+                ByteBuffer inputBuffer = codec.getInputBuffer(inputBufferId);
                 if (inputBuffer != null) {
                     inputBuffer.put(buffer.data(), 0, buffer.length());
-                    mDecoder.queueInputBuffer(inputBufferId, 0,
+                    codec.queueInputBuffer(inputBufferId, 0,
                             buffer.length(), System.nanoTime() / 1000, flag);
                 }
             }
 
             MediaCodec.BufferInfo info = mBufferInfo;
-            int outputBufferId = mDecoder.dequeueOutputBuffer(info, 0);
+            int outputBufferId = codec.dequeueOutputBuffer(info, 0);
 
             if (outputBufferId == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                 // decoder signals a format change — read resolution from the canonical no-arg call
-                MediaFormat format = mDecoder.getOutputFormat();
+                MediaFormat format = codec.getOutputFormat();
                 int mWidth  = format.getInteger(MediaFormat.KEY_WIDTH);
                 int mHeight = format.getInteger(MediaFormat.KEY_HEIGHT);
                 if (lastWidth != mWidth || lastHeight != mHeight) {
@@ -609,7 +629,7 @@ public class Decoder extends Activity {
                     updateResolution(lastWidth, lastHeight);
                 }
             } else if (outputBufferId >= 0) {
-                mDecoder.releaseOutputBuffer(outputBufferId, true);
+                codec.releaseOutputBuffer(outputBufferId, true);
             }
         } catch (Exception e) {
             Log.e(TAG, "Codec exception: " + e.getMessage());
@@ -634,8 +654,16 @@ public class Decoder extends Activity {
         try {
             Log.i(TAG, "Start video decoder");
             local = MediaCodec.createDecoderByType(type);
-            local.configure(format, mVideo, null, 0);
-            local.start();
+            // configure() and start() are split from createDecoderByType() so that
+            // if either throws, we can release() the already-created codec object —
+            // otherwise the native handle leaks until the next GC cycle
+            try {
+                local.configure(format, mVideo, null, 0);
+                local.start();
+            } catch (Exception e) {
+                local.release(); // prevent native MediaCodec handle leak
+                throw e;
+            }
         } catch (Exception e) {
             Log.e(TAG, "Cannot setup decoder: " + e.getMessage());
             decoderFailed = true; // codec likely unsupported; stop retrying until next session
@@ -963,7 +991,10 @@ public class Decoder extends Activity {
                         decodeFrame(buffer);
                     }
                 } catch (InterruptedException e) {
-                    Log.w(TAG, "Cannot decode video: " + e.getMessage());
+                    Thread.currentThread().interrupt(); // restore interrupt status and stop
+                    break;
+                } catch (Exception e) {
+                    Log.e(TAG, "Video decode error: " + e.getMessage());
                 }
             }
         }, "rtsp-video").start();
@@ -976,7 +1007,10 @@ public class Decoder extends Activity {
                         playAudio(buffer);
                     }
                 } catch (InterruptedException e) {
-                    Log.w(TAG, "Cannot decode audio: " + e.getMessage());
+                    Thread.currentThread().interrupt(); // restore interrupt status and stop
+                    break;
+                } catch (Exception e) {
+                    Log.e(TAG, "Audio playback error: " + e.getMessage());
                 }
             }
         }, "rtsp-audio").start();
