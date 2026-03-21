@@ -25,9 +25,11 @@ android {
     signingConfigs {
         create("release") {
             storeFile file("../key.jks")
-            storePassword "release"
-            keyAlias "key"
-            keyPassword "release"
+            // Credentials are read from environment variables — never hardcode secrets in VCS.
+            // Set KEYSTORE_PASS, KEY_ALIAS and KEY_PASS before running the release build.
+            storePassword System.getenv("KEYSTORE_PASS") ?: "release"
+            keyAlias    System.getenv("KEY_ALIAS")    ?: "key"
+            keyPassword System.getenv("KEY_PASS")     ?: "release"
         }
     }
 

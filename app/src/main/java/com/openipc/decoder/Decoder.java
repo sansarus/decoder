@@ -61,6 +61,7 @@ import java.net.DatagramSocket;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -89,6 +90,12 @@ public class Decoder extends Activity {
     // incremented in onPause so that orphaned threads from the previous
     // lifecycle can detect they are stale and exit their loops
     private volatile int listenerGen;
+
+    // set on audio init failure; cleared on session close to allow next retry
+    private volatile boolean audioFailed;
+
+    // pre-allocated to avoid per-frame GC pressure in the video decode loop
+    private final MediaCodec.BufferInfo mBufferInfo = new MediaCodec.BufferInfo();
 
     // read from the network thread, written from the UI thread
     private volatile String mHost;
@@ -160,7 +167,7 @@ public class Decoder extends Activity {
 
         PopupWindow popup = new PopupWindow(layout, LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT, true);
-        popup.showAtLocation(menu, Gravity.TOP | Gravity.START, 0, 80);
+        popup.showAtLocation(menu, Gravity.TOP | Gravity.START, 0, dp(20));
 
         LinearLayout header = new LinearLayout(this);
         header.setOrientation(LinearLayout.VERTICAL);
@@ -191,7 +198,15 @@ public class Decoder extends Activity {
 
         String code = "Exit [V1.0]";
         try {
-            String name = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+            String name;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                name = getPackageManager()
+                        .getPackageInfo(getPackageName(), PackageManager.PackageInfoFlags.of(0))
+                        .versionName;
+            } else {
+                //noinspection deprecation
+                name = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+            }
             code = "Exit [V" + name + "]";
         } catch (PackageManager.NameNotFoundException e) {
             Log.w(TAG, "Cannot extract version code");
@@ -218,7 +233,7 @@ public class Decoder extends Activity {
     private TextView createItem(String title) {
         TextView text = new TextView(this);
         text.setText(title);
-        text.setPadding(40, 40, 40, 40);
+        text.setPadding(dp(12), dp(12), dp(12), dp(12));
         text.setTextColor(Color.WHITE);
         text.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
         focusChange(text);
@@ -229,10 +244,11 @@ public class Decoder extends Activity {
     private EditText createEdit(String title) {
         EditText text = new EditText(this);
         text.setText(title);
-        text.setPadding(40, 40, 40, 40);
+        text.setPadding(dp(12), dp(12), dp(12), dp(12));
         text.setTextColor(Color.WHITE);
         text.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
-        text.setInputType(InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        // TYPE_TEXT_VARIATION_URI shows the text normally (not masked like a password)
+        text.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         text.setImeOptions(EditorInfo.IME_ACTION_DONE);
         text.setSelection(text.getText().length());
         focusChange(text);
@@ -254,6 +270,12 @@ public class Decoder extends Activity {
             }
             v.setBackground(border);
         });
+    }
+
+    /** Converts dp units to pixels using the current display density. */
+    private int dp(float dp) {
+        return (int) TypedValue.applyDimension(
+                TypedValue.COMPLEX_UNIT_DIP, dp, getResources().getDisplayMetrics());
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -298,6 +320,8 @@ public class Decoder extends Activity {
             dialog.getWindow().setLayout(screenWidth, WindowManager.LayoutParams.MATCH_PARENT);
         }
         dialog.show();
+        // release WebView native resources when the dialog is dismissed
+        dialog.setOnDismissListener(d -> view.destroy());
 
         if (link != null) {
             view.loadUrl("http://" + link);
@@ -428,7 +452,9 @@ public class Decoder extends Activity {
 
     private void playAudio(Frame data) {
         if (audioTrack == null) {
-            createAudio(data.length);
+            if (!audioFailed) {  // skip retry if init already failed for this session
+                createAudio(data.length);
+            }
         } else {
             audioTrack.write(data.data, 0, data.length);
         }
@@ -465,6 +491,7 @@ public class Decoder extends Activity {
         int size = AudioTrack.getMinBufferSize(sample, format, AudioFormat.ENCODING_PCM_16BIT);
         if (size <= 0) {  // ERROR (-1) or ERROR_BAD_VALUE (-2): unsupported sample rate
             Log.e(TAG, "Invalid audio parameters: sample=" + sample + " bufSize=" + size);
+            audioFailed = true;
             return;
         }
         audioTrack = new AudioTrack(AudioManager.STREAM_MUSIC, sample, format,
@@ -479,6 +506,7 @@ public class Decoder extends Activity {
             audioTrack.release();
             audioTrack = null;
         }
+        audioFailed = false; // allow re-init on the next session
     }
 
     private void decodeFrame(Frame buffer) {
@@ -506,7 +534,7 @@ public class Decoder extends Activity {
                 }
             }
 
-            MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+            MediaCodec.BufferInfo info = mBufferInfo;
             int outputBufferId = mDecoder.dequeueOutputBuffer(info, 0);
 
             if (outputBufferId >= 0) {
@@ -537,8 +565,7 @@ public class Decoder extends Activity {
         MediaCodec local;
         String type = codecH265 ? "video/hevc" : "video/avc";
 
-        MediaFormat format;
-        format = MediaFormat.createVideoFormat(type, 1280, 720);
+        MediaFormat format = MediaFormat.createVideoFormat(type, 1280, 720);
 
         try {
             Log.i(TAG, "Start video decoder");
@@ -561,7 +588,7 @@ public class Decoder extends Activity {
                 mDecoder.stop();
                 mDecoder.release();
             } catch (Exception e) {
-                Log.e(TAG, "Decoder exception");
+                Log.e(TAG, "Decoder exception", e);
             }
             mDecoder = null;
         }
@@ -571,7 +598,7 @@ public class Decoder extends Activity {
         nalSize = 0; // discard any partial NAL fragment from the previous session
         Uri uri = Uri.parse(mHost);
         try (Socket s = new Socket()) {
-            int port = Uri.parse(mHost).getPort();
+            int port = uri.getPort();
             s.connect(new InetSocketAddress(uri.getHost(), port < 0 ? 554 : port), 1000);
             s.setSoTimeout(1000);
             BufferedReader r = new BufferedReader(new InputStreamReader(s.getInputStream()));
@@ -583,13 +610,13 @@ public class Decoder extends Activity {
             String auth = "";
             if (user != null) {
                 auth = "Authorization: Basic " +
-                        Base64.encodeToString(user.getBytes(), Base64.NO_WRAP) + "\r\n";
+                        Base64.encodeToString(user.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP) + "\r\n";
             }
 
             int seq = 1;
             String desc = "DESCRIBE " + mHost + " RTSP/1.0\r\n" +
                     "CSeq: " + seq + "\r\n" + auth + "Accept: application/sdp\r\n\r\n";
-            w.write(desc.getBytes());
+            w.write(desc.getBytes(StandardCharsets.UTF_8));
             w.flush();
 
             String line;
@@ -602,7 +629,7 @@ public class Decoder extends Activity {
                     : "RTP/AVP/TCP;unicast;interleaved=0-1";
             String video = "SETUP " + mHost + "/trackID=0 RTSP/1.0\r\n" +
                     "CSeq: " + seq + "\r\n" + auth + "Transport: " + type + "\r\n\r\n";
-            w.write(video.getBytes());
+            w.write(video.getBytes(StandardCharsets.UTF_8));
             w.flush();
 
             String session = null;
@@ -623,7 +650,7 @@ public class Decoder extends Activity {
             String audio = "SETUP " + mHost + "/trackID=1 RTSP/1.0\r\n" +
                     "CSeq: " + seq + "\r\n" + auth + "Transport: " + type + "\r\n" +
                     "Session: " + session + "\r\n\r\n";
-            w.write(audio.getBytes());
+            w.write(audio.getBytes(StandardCharsets.UTF_8));
             w.flush();
 
             while ((line = r.readLine()) != null && !line.isEmpty()) {
@@ -633,7 +660,7 @@ public class Decoder extends Activity {
             seq++;
             String play = "PLAY " + mHost + " RTSP/1.0\r\n" +
                     "CSeq: " + seq + "\r\n" + auth + "Session: " + session + "\r\n\r\n";
-            w.write(play.getBytes());
+            w.write(play.getBytes(StandardCharsets.UTF_8));
             w.flush();
 
             while ((line = r.readLine()) != null && !line.isEmpty()) {
@@ -699,11 +726,9 @@ public class Decoder extends Activity {
             processAudio(frame);
             return;
         } else if (payload == 99) {
-            //Log.w(TAG, "AAC codec not supported");
-            return;
+            return; // AAC not supported
         } else if (payload == 98) {
-            //Log.w(TAG, "Opus codec not supported");
-            return;
+            return; // Opus not supported
         } else if (payload == 97 || payload == 96) {
             codecH265 = payload == 97;
             Frame output = buildFrame(frame);
