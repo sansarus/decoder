@@ -3,6 +3,7 @@ on:
   push:
     branches:
       - master
+      - ystinia
   workflow_dispatch:
 
 jobs:
@@ -12,6 +13,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set artifact name
+        id: vars
+        run: |
+          if [ "${{ github.ref_name }}" = "master" ]; then
+            echo "name=Decoder" >> $GITHUB_OUTPUT
+          else
+            echo "name=Decoder-NG" >> $GITHUB_OUTPUT
+          fi
+
       - name: Build
         run: |
           sudo apt-get update
@@ -19,14 +29,14 @@ jobs:
           export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
           echo ${{secrets.KEY}} | base64 -d > key.jks
           ./gradlew bundleRelease
-          mv app/build/outputs/bundle/release/app-release.aab Decoder.aab
+          mv app/build/outputs/bundle/release/app-release.aab ${{ steps.vars.outputs.name }}.aab
           ./gradlew assembleRelease
-          mv app/build/outputs/apk/release/app-release.apk Decoder.apk
+          mv app/build/outputs/apk/release/app-release.apk ${{ steps.vars.outputs.name }}.apk
 
       - name: Upload
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
           files: |
-            Decoder.aab
-            Decoder.apk
+            ${{ steps.vars.outputs.name }}.aab
+            ${{ steps.vars.outputs.name }}.apk
