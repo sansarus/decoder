@@ -61,6 +61,7 @@ import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.Locale;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -171,6 +172,12 @@ public class Decoder extends Activity {
 
         mConnect.setText(mHost);
         activeStream = false;
+        // close the active stream sockets so the network thread unblocks immediately
+        // instead of waiting for the next packet or the UDP 1-second receive timeout
+        Socket tcp = mTcpSocket;
+        if (tcp != null) try { tcp.close(); } catch (Exception ignored) {}
+        DatagramSocket udp = mUdpSocket;
+        if (udp != null) try { udp.close(); } catch (Exception ignored) {}
     }
 
     private void createMenu(View menu) {
@@ -694,7 +701,9 @@ public class Decoder extends Activity {
         String line;
         while ((line = readLine(in)) != null && !line.isEmpty()) {
             Log.i(TAG, line);
-            if (targetHeader != null && line.startsWith(targetHeader)) {
+            // RFC 2326: header names are case-insensitive
+            if (targetHeader != null && line.toLowerCase(Locale.ROOT)
+                    .startsWith(targetHeader.toLowerCase(Locale.ROOT))) {
                 // extract value, stripping optional parameters (e.g. "Session: abc;timeout=60")
                 found = line.substring(targetHeader.length()).split(";")[0].trim();
             }
@@ -705,9 +714,13 @@ public class Decoder extends Activity {
     private void rtspConnect() throws Exception {
         nalSize = 0; // discard any partial NAL fragment from the previous session
         Uri uri = Uri.parse(mHost);
+        String host = uri.getHost();
+        if (host == null || host.isEmpty()) {
+            throw new IOException("Invalid RTSP URL: no host in '" + mHost + "'");
+        }
         try (Socket s = new Socket()) {
             int port = uri.getPort();
-            s.connect(new InetSocketAddress(uri.getHost(), port < 0 ? 554 : port), 1000);
+            s.connect(new InetSocketAddress(host, port < 0 ? 554 : port), 1000);
             s.setSoTimeout(1000);
             // use the raw InputStream — a BufferedReader would pre-read RTP stream bytes
             // into its internal buffer, making them unavailable to tcpStream()
@@ -931,6 +944,11 @@ public class Decoder extends Activity {
                     if (SystemClock.elapsedRealtime() - lastFrame > 3000) {
                         Log.w(TAG, "Stream is inactive");
                         activeStream = false;
+                        // close the TCP socket so input.read() unblocks immediately —
+                        // without this, a dead camera causes the network thread to hang
+                        // until the next onPause() (UDP is already covered by setSoTimeout)
+                        Socket tcp = mTcpSocket;
+                        if (tcp != null) try { tcp.close(); } catch (Exception ignored) {}
                     }
                 }
                 SystemClock.sleep(1000);
