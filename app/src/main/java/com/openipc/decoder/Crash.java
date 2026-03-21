@@ -25,7 +25,7 @@ public class Crash extends Activity {
         errorView.setPadding(24, 12, 24, 12);
 
         String error = getIntent().getStringExtra("error");
-        errorView.setText(error);
+        errorView.setText(error != null ? error : "Unknown error");
 
         ScrollView scrollView = new ScrollView(this);
         scrollView.addView(errorView);

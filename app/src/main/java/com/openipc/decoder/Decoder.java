@@ -68,19 +68,20 @@ public class Decoder extends Activity {
     private final BlockingQueue<Frame> pcmQueue = new ArrayBlockingQueue<>(32);
     private final byte[] nalBuffer = new byte[1024 * 1024];
 
-    private int nalSize;
-    private MediaCodec mDecoder;
+    // volatile: these fields are read/written from multiple threads
+    private volatile int nalSize;
+    private volatile MediaCodec mDecoder;
     private SurfaceView mSurface;
-    private AudioTrack audioTrack;
+    private volatile AudioTrack audioTrack;
     private TextView mConnect;
 
-    private boolean codecH265;
-    private boolean lastCodec;
-    private boolean listener;
-    private boolean activeStream;
-    private int lastWidth;
-    private int lastHeight;
-    private long lastFrame;
+    private volatile boolean codecH265;
+    private volatile boolean lastCodec;
+    private volatile boolean listener;
+    private volatile boolean activeStream;
+    private volatile int lastWidth;
+    private volatile int lastHeight;
+    private volatile long lastFrame;
 
     private String mHost;
     private boolean mType;
@@ -388,7 +389,7 @@ public class Decoder extends Activity {
 
         byte[] data = new byte[length];
         System.arraycopy(frame.data(), header, data, 0, length);
-        for (int i = 0; i < length; i += 2) {
+        for (int i = 0; i + 1 < length; i += 2) { // guard against odd-length frames
             byte tmp = data[i];
             data[i] = data[i + 1];
             data[i + 1] = tmp;
@@ -465,7 +466,7 @@ public class Decoder extends Activity {
             }
         } catch (Exception e) {
             Log.e(TAG, "Codec exception: " + e.getMessage());
-            mDecoder = null;
+            closeDecoder(); // stop() + release() to avoid native resource leak
         }
     }
 
@@ -509,6 +510,7 @@ public class Decoder extends Activity {
     }
 
     private void rtsp_connect() throws Exception {
+        nalSize = 0; // discard any partial NAL fragment from the previous session
         Uri uri = Uri.parse(mHost);
         try (Socket s = new Socket()) {
             int port = Uri.parse(mHost).getPort();
@@ -551,6 +553,10 @@ public class Decoder extends Activity {
                     session = line.replace("Session:", "").split(";")[0].trim();
                 }
                 Log.i(TAG, line);
+            }
+
+            if (session == null) {
+                throw new IOException("RTSP server did not return a Session header");
             }
 
             seq++;
@@ -598,17 +604,22 @@ public class Decoder extends Activity {
 
     private void tcp_stream(InputStream input) throws IOException {
         while (activeStream) {
-            if (input.read() != 0x24) {
-                continue;
-            }
+            int b = input.read();
+            if (b == -1) break;      // server closed the connection
+            if (b != 0x24) continue; // not an RTSP interleaved marker — skip
 
             int channel = input.read();
-            int len = (input.read() << 8) | input.read();
-            byte[] data = new byte[len];
+            int hi = input.read();
+            int lo = input.read();
+            if (channel == -1 || hi == -1 || lo == -1) break; // unexpected EOF in header
+            int len = (hi << 8) | lo;
 
+            byte[] data = new byte[len];
             int read = 0;
             while (read < len) {
-                read += input.read(data, read, len - read);
+                int n = input.read(data, read, len - read);
+                if (n == -1) throw new IOException("stream truncated mid-packet");
+                read += n;
             }
 
             if (channel == 0 || channel == 2) {
