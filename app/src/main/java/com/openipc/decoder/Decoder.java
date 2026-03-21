@@ -181,6 +181,7 @@ public class Decoder extends Activity {
     /** Strip CR/LF to prevent CRLF injection into RTSP header lines. */
     private static String sanitizeUrl(String url) {
         return url.replaceAll("[\r\n]", "");
+    }
 
     private void saveSettings() {
         SharedPreferences pref = getSharedPreferences("settings", MODE_PRIVATE);
@@ -521,7 +522,10 @@ public class Decoder extends Activity {
         }
 
         // middle fragment: accumulating, frame not yet complete
-        return null;(Frame data) {
+        return null;
+    }
+
+    private void playAudio(Frame data) {
         // snapshot to a local: onPause() can null audioTrack from the UI thread at any moment
         AudioTrack track = audioTrack;
         if (track == null) {
