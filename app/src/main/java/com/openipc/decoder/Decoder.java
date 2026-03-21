@@ -405,6 +405,7 @@ public class Decoder extends Activity {
 
         if (lastCodec != codecH265) {
             lastCodec = codecH265;
+            nalSize = 0; // discard any partial NAL fragment from the previous codec
             closeDecoder();
             Log.d(TAG, "Set codec to " + (codecH265 ? "H265" : "H264"));
         }
@@ -573,11 +574,18 @@ public class Decoder extends Activity {
     }
 
     private void closeAudio() {
-        if (audioTrack != null) {
-            Log.i(TAG, "Close audio decoder");
-            audioTrack.stop();
-            audioTrack.release();
+        AudioTrack track = audioTrack;
+        if (track != null) {
+            // null the field BEFORE stop/release: any concurrent playAudio() snapshot
+            // will then see null and skip, rather than writing to a released AudioTrack
             audioTrack = null;
+            Log.i(TAG, "Close audio decoder");
+            try {
+                track.stop();
+                track.release();
+            } catch (Exception e) {
+                Log.e(TAG, "Audio close exception", e);
+            }
         }
         audioFailed = false; // allow re-init on the next session
     }
@@ -675,15 +683,18 @@ public class Decoder extends Activity {
     }
 
     private void closeDecoder() {
-        if (mDecoder != null) {
+        MediaCodec codec = mDecoder;
+        if (codec != null) {
+            // null the field BEFORE stop/release: any concurrent decodeFrame() snapshot
+            // will then see null and skip, rather than operating on a stopping codec
+            mDecoder = null;
             Log.i(TAG, "Close video decoder");
             try {
-                mDecoder.stop();
-                mDecoder.release();
+                codec.stop();
+                codec.release();
             } catch (Exception e) {
-                Log.e(TAG, "Decoder exception", e);
+                Log.e(TAG, "Decoder close exception", e);
             }
-            mDecoder = null;
         }
         decoderFailed = false; // allow re-init on the next RTSP session
     }
@@ -927,7 +938,8 @@ public class Decoder extends Activity {
                         Log.w(TAG, "Video queue full, frame dropped");
                     }
                 } catch (InterruptedException e) {
-                    Log.w(TAG, "Video thread interrupted");
+                    Thread.currentThread().interrupt(); // restore interrupt status for the caller
+                    Log.w(TAG, "Video queue interrupted");
                 }
             }
 
