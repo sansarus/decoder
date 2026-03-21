@@ -58,6 +58,7 @@ import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -66,6 +67,7 @@ import java.util.concurrent.TimeUnit;
 
 public class Decoder extends Activity {
     private static final String TAG = "OpenIPCDecoder";
+    private static final String UA  = "User-Agent: OpenIPC-Decoder/1.0\r\n";
     private final BlockingQueue<Frame> nalQueue = new ArrayBlockingQueue<>(32);
     private final BlockingQueue<Frame> pcmQueue = new ArrayBlockingQueue<>(32);
     private final byte[] nalBuffer = new byte[1024 * 1024];
@@ -91,6 +93,13 @@ public class Decoder extends Activity {
 
     // set on audio init failure; cleared on session close to allow next retry
     private volatile boolean audioFailed;
+
+    // set on codec init failure; prevents per-frame retry when codec is unsupported
+    private volatile boolean decoderFailed;
+
+    // held so onPause() can close them to unblock blocking read()/receive() on the network thread
+    private volatile Socket mTcpSocket;
+    private volatile DatagramSocket mUdpSocket;
 
     // pre-allocated to avoid per-frame GC pressure in the video decode loop
     private final MediaCodec.BufferInfo mBufferInfo = new MediaCodec.BufferInfo();
@@ -535,7 +544,7 @@ public class Decoder extends Activity {
 
     private void decodeFrame(Frame buffer) {
         if (mDecoder == null) {
-            createDecoder();
+            if (!decoderFailed) createDecoder(); // skip if codec proved unsupported
             return;
         }
 
@@ -601,6 +610,7 @@ public class Decoder extends Activity {
             local.start();
         } catch (Exception e) {
             Log.e(TAG, "Cannot setup decoder: " + e.getMessage());
+            decoderFailed = true; // codec likely unsupported; stop retrying until next session
             return;
         }
 
@@ -619,14 +629,17 @@ public class Decoder extends Activity {
             }
             mDecoder = null;
         }
+        decoderFailed = false; // allow re-init on the next RTSP session
     }
 
     /**
      * Reads one CRLF-terminated line from a raw InputStream without any internal buffering,
      * so the stream position is left exactly after the '\n' — no bytes are consumed in advance.
+     * A BufferedReader/BufferedInputStream must NOT be used here: after PLAY the camera
+     * immediately starts sending RTP data, and any pre-read bytes would be silently lost.
      */
     private static String readLine(InputStream in) throws IOException {
-        StringBuilder sb = new StringBuilder();
+        StringBuilder sb = new StringBuilder(128); // pre-sized for a typical header line
         int c;
         while ((c = in.read()) != -1) {
             if (c == '\n') return sb.toString();
@@ -691,7 +704,7 @@ public class Decoder extends Activity {
 
             int seq = 1;
             String desc = "DESCRIBE " + mHost + " RTSP/1.0\r\n" +
-                    "CSeq: " + seq + "\r\n" + auth + "Accept: application/sdp\r\n\r\n";
+                    "CSeq: " + seq + "\r\n" + auth + UA + "Accept: application/sdp\r\n\r\n";
             w.write(desc.getBytes(StandardCharsets.UTF_8));
             w.flush();
 
@@ -714,7 +727,7 @@ public class Decoder extends Activity {
             String type = mType ? "RTP/AVP/UDP;unicast;client_port=5000"
                     : "RTP/AVP/TCP;unicast;interleaved=0-1";
             String video = "SETUP " + mHost + "/trackID=0 RTSP/1.0\r\n" +
-                    "CSeq: " + seq + "\r\n" + auth + "Transport: " + type + "\r\n\r\n";
+                    "CSeq: " + seq + "\r\n" + auth + UA + "Transport: " + type + "\r\n\r\n";
             w.write(video.getBytes(StandardCharsets.UTF_8));
             w.flush();
 
@@ -728,7 +741,7 @@ public class Decoder extends Activity {
             type = mType ? "RTP/AVP/UDP;unicast;client_port=5002"
                     : "RTP/AVP/TCP;unicast;interleaved=2-3";
             String audio = "SETUP " + mHost + "/trackID=1 RTSP/1.0\r\n" +
-                    "CSeq: " + seq + "\r\n" + auth + "Transport: " + type + "\r\n" +
+                    "CSeq: " + seq + "\r\n" + auth + UA + "Transport: " + type + "\r\n" +
                     "Session: " + session + "\r\n\r\n";
             w.write(audio.getBytes(StandardCharsets.UTF_8));
             w.flush();
@@ -737,7 +750,7 @@ public class Decoder extends Activity {
 
             seq++;
             String play = "PLAY " + mHost + " RTSP/1.0\r\n" +
-                    "CSeq: " + seq + "\r\n" + auth + "Session: " + session + "\r\n\r\n";
+                    "CSeq: " + seq + "\r\n" + auth + UA + "Session: " + session + "\r\n\r\n";
             w.write(play.getBytes(StandardCharsets.UTF_8));
             w.flush();
 
@@ -751,21 +764,38 @@ public class Decoder extends Activity {
             activeStream = true;
             if (mType) {
                 try (DatagramSocket d = new DatagramSocket(5000)) {
-                    udpStream(d);
+                    mUdpSocket = d; // stored so onPause() can close it to unblock receive()
+                    try {
+                        udpStream(d);
+                    } finally {
+                        mUdpSocket = null;
+                    }
                 }
             } else {
-                // pass the same InputStream used for handshake — no bytes are lost
-                tcpStream(input);
+                mTcpSocket = s; // stored so onPause() can close it to unblock read()
+                try {
+                    // pass the same InputStream used for handshake — no bytes are lost
+                    tcpStream(input);
+                } finally {
+                    mTcpSocket = null;
+                }
             }
         }
     }
 
     private void udpStream(DatagramSocket d) throws IOException {
+        // wake up every second so the activeStream flag is checked even when the camera
+        // goes silent (power cycle, network loss); prevents permanent thread leak
+        d.setSoTimeout(1000);
         // single buffer reused every packet — avoids per-frame allocation at 25-30 fps
         byte[] buf = new byte[65535];
         DatagramPacket packet = new DatagramPacket(buf, buf.length);
         while (activeStream) {
-            d.receive(packet);
+            try {
+                d.receive(packet);
+            } catch (SocketTimeoutException ignored) {
+                continue; // re-check activeStream
+            }
             processPacket(new Frame(packet.getData(), packet.getLength()));
         }
     }
@@ -903,6 +933,12 @@ public class Decoder extends Activity {
             listenerGen++;  // invalidate all threads from the current generation
             listener = false;
             activeStream = false;
+            // close active sockets to immediately unblock any blocking read()/receive()
+            // on the network thread; without this, a silent camera causes a thread leak
+            Socket tcp = mTcpSocket;
+            if (tcp != null) try { tcp.close(); } catch (Exception ignored) {}
+            DatagramSocket udp = mUdpSocket;
+            if (udp != null) try { udp.close(); } catch (Exception ignored) {}
             closeDecoder();
             closeAudio();
             // discard stale frames so the new session starts with a clean slate
