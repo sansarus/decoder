@@ -67,7 +67,7 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
 
 public class Decoder extends Activity {
-    private final String TAG = "OpenIPCDecoder";
+    private static final String TAG = "OpenIPCDecoder";
     private final BlockingQueue<Frame> nalQueue = new ArrayBlockingQueue<>(32);
     private final BlockingQueue<Frame> pcmQueue = new ArrayBlockingQueue<>(32);
     private final byte[] nalBuffer = new byte[1024 * 1024];
@@ -439,6 +439,10 @@ public class Decoder extends Activity {
             nalBuffer[2] = 0;
             nalBuffer[3] = 1;
 
+            if (nalBit + rxSize > nalBuffer.length) {  // guard: single-NAL overflow
+                Log.e(TAG, "Single NAL too large (" + rxSize + " bytes), dropping");
+                return null;
+            }
             System.arraycopy(rxBuffer, cpSize, nalBuffer, nalBit, rxSize);
             nalSize = rxSize + nalBit;
 
@@ -453,10 +457,10 @@ public class Decoder extends Activity {
     private void playAudio(Frame data) {
         if (audioTrack == null) {
             if (!audioFailed) {  // skip retry if init already failed for this session
-                createAudio(data.length);
+                createAudio(data.length());
             }
         } else {
-            audioTrack.write(data.data, 0, data.length);
+            audioTrack.write(data.data(), 0, data.length());
         }
     }
 
@@ -477,7 +481,11 @@ public class Decoder extends Activity {
 
         Frame buffer = new Frame(data, length);
         try {
-            pcmQueue.put(buffer);
+            // offer() with a timeout to avoid blocking the network thread when
+            // the audio consumer stalls; drop the frame if the queue stays full
+            if (!pcmQueue.offer(buffer, 200, TimeUnit.MILLISECONDS)) {
+                Log.w(TAG, "Audio queue full, frame dropped");
+            }
         } catch (InterruptedException e) {
             Log.w(TAG, "Audio thread interrupted");
         }
@@ -518,7 +526,7 @@ public class Decoder extends Activity {
         lastFrame = SystemClock.elapsedRealtime();
 
         int flag = 0;
-        int fragment = getFragment(buffer.data[4]);
+        int fragment = getFragment(buffer.data()[4]);
         if (fragment == 32 || fragment == 33 || fragment == 34) {
             flag = MediaCodec.BUFFER_FLAG_CODEC_CONFIG;
         }
@@ -528,9 +536,9 @@ public class Decoder extends Activity {
             if (inputBufferId >= 0) {
                 ByteBuffer inputBuffer = mDecoder.getInputBuffer(inputBufferId);
                 if (inputBuffer != null) {
-                    inputBuffer.put(buffer.data, 0, buffer.length);
+                    inputBuffer.put(buffer.data(), 0, buffer.length());
                     mDecoder.queueInputBuffer(inputBufferId, 0,
-                            buffer.length, System.nanoTime() / 1000, flag);
+                            buffer.length(), System.nanoTime() / 1000, flag);
                 }
             }
 
@@ -566,6 +574,9 @@ public class Decoder extends Activity {
         String type = codecH265 ? "video/hevc" : "video/avc";
 
         MediaFormat format = MediaFormat.createVideoFormat(type, 1280, 720);
+        // pre-declare the max input size to match our NAL buffer; prevents
+        // BufferOverflowException when a large intra-frame arrives
+        format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 1024 * 1024);
 
         try {
             Log.i(TAG, "Start video decoder");
@@ -620,9 +631,17 @@ public class Decoder extends Activity {
             w.flush();
 
             String line;
+            int descContentLength = 0;
             while ((line = r.readLine()) != null && !line.isEmpty()) {
+                if (line.startsWith("Content-Length:")) {
+                    // capture body size so we can skip the SDP body below
+                    try { descContentLength = Integer.parseInt(line.substring(15).trim()); }
+                    catch (NumberFormatException ignored) {}
+                }
                 Log.i(TAG, line);
             }
+            // consume the SDP body — leaving it unread would poison SETUP response parsing
+            if (descContentLength > 0) r.skip(descContentLength);
 
             seq++;
             String type = mType ? "RTP/AVP/UDP;unicast;client_port=5000"
@@ -669,6 +688,9 @@ public class Decoder extends Activity {
 
             // disable read timeout before streaming: keyframe intervals often exceed 1 second
             s.setSoTimeout(0);
+            // reset watchdog baseline so the 3-second timeout counts from now,
+            // not from the epoch (lastFrame == 0 would trigger the watchdog immediately)
+            lastFrame = SystemClock.elapsedRealtime();
             activeStream = true;
             if (mType) {
                 try (DatagramSocket d = new DatagramSocket(5000)) {
@@ -682,7 +704,7 @@ public class Decoder extends Activity {
 
     private void udp_stream(DatagramSocket d) throws IOException {
         while (activeStream) {
-            byte[] data = new byte[2048];
+            byte[] data = new byte[65535]; // max UDP payload size
             DatagramPacket packet = new DatagramPacket(data, data.length);
             d.receive(packet);
             processPacket(new Frame(packet.getData(), packet.getLength()));
