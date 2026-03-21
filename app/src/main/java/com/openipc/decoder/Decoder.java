@@ -74,7 +74,7 @@ public class Decoder extends Activity {
     private final byte[] nalBuffer = new byte[1024 * 1024];
 
     // volatile: these fields are read/written from multiple threads
-    private volatile int nalSize;
+    private int nalSize;            // only touched on the network thread — no volatile needed
     private volatile MediaCodec mDecoder;
     private SurfaceView mSurface;
     private volatile AudioTrack audioTrack;
@@ -115,7 +115,7 @@ public class Decoder extends Activity {
     private volatile boolean mType;
 
     // tracks last warned unknown RTP payload type to suppress log spam on the network thread
-    private volatile int lastUnknownPayload = -1;
+    private int lastUnknownPayload = -1; // only accessed on the network thread — no volatile needed
 
     // RTP fragmentation unit NAL types
     private static final int RTP_FU_H264  = 28;  // H.264 FU-A
@@ -547,7 +547,7 @@ public class Decoder extends Activity {
         AudioTrack track = audioTrack;
         if (track == null) {
             if (!audioFailed) {  // skip retry if init already failed for this session
-                createAudio(data.length());
+                createAudio();
             }
         } else {
             // write() may return a positive number less than the requested length;
@@ -602,12 +602,7 @@ public class Decoder extends Activity {
         }
     }
 
-    private void createAudio(int length) {
-        if (length <= 0) {
-            Log.e(TAG, "Invalid audio frame length: " + length);
-            audioFailed = true;
-            return;
-        }
+    private void createAudio() {
         // use the clock rate extracted from SDP; falls back to the 8000 Hz default
         int sample = audioSampleRate;
         int format = AudioFormat.CHANNEL_OUT_MONO;
@@ -693,6 +688,7 @@ public class Decoder extends Activity {
             if (inputBufferId >= 0) {
                 ByteBuffer inputBuffer = codec.getInputBuffer(inputBufferId);
                 if (inputBuffer != null) {
+                    inputBuffer.clear(); // reset position/limit — dequeue does not guarantee this
                     inputBuffer.put(buffer.data(), 0, buffer.length());
                     codec.queueInputBuffer(inputBufferId, 0,
                             buffer.length(), System.nanoTime() / 1000, flag);
@@ -864,7 +860,7 @@ public class Decoder extends Activity {
         Uri uri = Uri.parse(mHost);
         String host = uri.getHost();
         if (host == null || host.isEmpty()) {
-            throw new IOException("Invalid RTSP URL: no host in '" + mHost + "'");
+            throw new IOException("Invalid RTSP URL: host is missing or empty");
         }
         try (Socket s = new Socket()) {
             int port = uri.getPort();
@@ -1006,13 +1002,19 @@ public class Decoder extends Activity {
         byte[] pktBuf = new byte[65535];
         while (activeStream) {
             int b = input.read();
-            if (b == -1) break;      // server closed the connection
+            if (b == -1) {
+                activeStream = false; // server closed connection cleanly — signal reconnect
+                break;
+            }
             if (b != 0x24) continue; // not an RTSP interleaved marker — skip
 
             int channel = input.read();
             int hi = input.read();
             int lo = input.read();
-            if (channel == -1 || hi == -1 || lo == -1) break; // unexpected EOF in header
+            if (channel == -1 || hi == -1 || lo == -1) {
+                activeStream = false; // unexpected EOF inside interleaved header
+                break;
+            }
             int len = (hi << 8) | lo;
             // A zero-length or oversized packet is malformed; skip it to avoid
             // an empty read loop or an out-of-bounds access into pktBuf.
@@ -1040,6 +1042,17 @@ public class Decoder extends Activity {
             return;
         }
         byte[] data = frame.data();
+
+        // Validate that no CSRC list or header extension is present.
+        // Both shift the payload start beyond byte 12 — unsupported for now.
+        // OpenIPC cameras always send CC=0 and X=0, so this guards against malformed streams.
+        int cc = data[0] & 0x0F;
+        boolean hasExt = (data[0] & 0x10) != 0;
+        if (cc != 0 || hasExt) {
+            Log.w(TAG, "Unsupported RTP header: CC=" + cc + " X=" + (hasExt ? 1 : 0) + ", dropping");
+            return;
+        }
+
         int payload = (data[1] & 0x7F);
         if (payload == RTP_PT_PCMU) {
             processAudio(frame);
