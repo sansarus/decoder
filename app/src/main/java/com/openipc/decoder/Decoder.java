@@ -82,7 +82,7 @@ public class Decoder extends Activity {
 
     private volatile boolean codecH265;
     private boolean lastCodec; // only accessed on the network thread — volatile not needed
-    private volatile boolean listener;
+    private boolean listener;       // only accessed on the UI thread — no volatile needed
     private volatile boolean activeStream;
     private volatile int lastWidth;
     private volatile int lastHeight;
@@ -142,7 +142,7 @@ public class Decoder extends Activity {
     private volatile int audioSampleRate = 8000;
 
     // reference kept so we can dismiss the dialog (and destroy the WebView) on rotation
-    private volatile Dialog mBrowserDialog;
+    private Dialog mBrowserDialog; // only accessed on the UI thread — no volatile needed
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -879,9 +879,12 @@ public class Decoder extends Activity {
                 auth = "Authorization: Basic " +
                         Base64.encodeToString(user.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP) + "\r\n";
             }
+            // Strip userinfo from the request-line URL: credentials belong only in the
+            // Authorization header — including them in the URL leaks them to server access logs.
+            String rtspUrl = uri.buildUpon().userInfo(null).build().toString();
 
             int seq = 1;
-            String desc = "DESCRIBE " + mHost + " RTSP/1.0\r\n" +
+            String desc = "DESCRIBE " + rtspUrl + " RTSP/1.0\r\n" +
                     "CSeq: " + seq + "\r\n" + auth + UA + "Accept: application/sdp\r\n\r\n";
             w.write(desc.getBytes(StandardCharsets.UTF_8));
             w.flush();
@@ -908,7 +911,7 @@ public class Decoder extends Activity {
             seq++;
             String type = mType ? "RTP/AVP/UDP;unicast;client_port=5000"
                     : "RTP/AVP/TCP;unicast;interleaved=0-1";
-            String video = "SETUP " + mHost + "/trackID=0 RTSP/1.0\r\n" +
+            String video = "SETUP " + rtspUrl + "/trackID=0 RTSP/1.0\r\n" +
                     "CSeq: " + seq + "\r\n" + auth + UA + "Transport: " + type + "\r\n\r\n";
             w.write(video.getBytes(StandardCharsets.UTF_8));
             w.flush();
@@ -924,7 +927,7 @@ public class Decoder extends Activity {
             seq++;
             type = mType ? "RTP/AVP/UDP;unicast;client_port=5002"
                     : "RTP/AVP/TCP;unicast;interleaved=2-3";
-            String audio = "SETUP " + mHost + "/trackID=1 RTSP/1.0\r\n" +
+            String audio = "SETUP " + rtspUrl + "/trackID=1 RTSP/1.0\r\n" +
                     "CSeq: " + seq + "\r\n" + auth + UA + "Transport: " + type + "\r\n" +
                     "Session: " + session + "\r\n\r\n";
             w.write(audio.getBytes(StandardCharsets.UTF_8));
@@ -933,7 +936,7 @@ public class Decoder extends Activity {
             readRtspResponse(input, null);
 
             seq++;
-            String play = "PLAY " + mHost + " RTSP/1.0\r\n" +
+            String play = "PLAY " + rtspUrl + " RTSP/1.0\r\n" +
                     "CSeq: " + seq + "\r\n" + auth + UA + "Session: " + session + "\r\n\r\n";
             w.write(play.getBytes(StandardCharsets.UTF_8));
             w.flush();
@@ -969,7 +972,7 @@ public class Decoder extends Activity {
                 // tell the server to release the session; best-effort — ignore errors if
                 // the socket was already closed by onPause()
                 try {
-                    String teardown = "TEARDOWN " + mHost + " RTSP/1.0\r\n" +
+                    String teardown = "TEARDOWN " + rtspUrl + " RTSP/1.0\r\n" +
                             "CSeq: " + (seq + 1) + "\r\n" + auth + UA +
                             "Session: " + session + "\r\n\r\n";
                     w.write(teardown.getBytes(StandardCharsets.UTF_8));
