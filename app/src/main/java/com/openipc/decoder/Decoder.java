@@ -51,10 +51,8 @@ import android.widget.LinearLayout;
 import android.widget.PopupWindow;
 import android.widget.TextView;
 
-import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
@@ -418,6 +416,13 @@ public class Decoder extends Activity {
                 }
                 System.arraycopy(rxBuffer, cpSize, nalBuffer, nalBit, rxSize);
                 nalSize = rxSize + nalBit;
+
+                if (endBit > 0) {
+                    // single-fragment NAL (start and end both set): flush as a complete frame
+                    byte[] output = new byte[nalSize];
+                    System.arraycopy(nalBuffer, 0, output, 0, nalSize);
+                    return new Frame(output, nalSize);
+                }
             } else {
                 cpSize++;
                 rxSize--;
@@ -507,6 +512,14 @@ public class Decoder extends Activity {
         }
         audioTrack = new AudioTrack(AudioManager.STREAM_MUSIC, sample, format,
                 AudioFormat.ENCODING_PCM_16BIT, size, AudioTrack.MODE_STREAM);
+        if (audioTrack.getState() != AudioTrack.STATE_INITIALIZED) {
+            // resource exhaustion or invalid config at the OS audio layer
+            Log.e(TAG, "AudioTrack failed to initialize, releasing");
+            audioTrack.release();
+            audioTrack = null;
+            audioFailed = true;
+            return;
+        }
         audioTrack.play();
     }
 
@@ -608,6 +621,53 @@ public class Decoder extends Activity {
         }
     }
 
+    /**
+     * Reads one CRLF-terminated line from a raw InputStream without any internal buffering,
+     * so the stream position is left exactly after the '\n' — no bytes are consumed in advance.
+     */
+    private static String readLine(InputStream in) throws IOException {
+        StringBuilder sb = new StringBuilder();
+        int c;
+        while ((c = in.read()) != -1) {
+            if (c == '\n') return sb.toString();
+            if (c != '\r') sb.append((char) c);
+        }
+        return sb.length() > 0 ? sb.toString() : null;
+    }
+
+    /**
+     * Reads a complete RTSP response (status line + headers until blank line).
+     * Throws IOException if the status code is not 2xx.
+     * Returns the trimmed value of {@code targetHeader}, or null if the header is absent.
+     */
+    private static String readRtspResponse(InputStream in, String targetHeader) throws IOException {
+        String status = readLine(in);
+        if (status == null) throw new IOException("Server closed connection during handshake");
+        Log.i(TAG, status);
+
+        // validate that the response is a 2xx success
+        String[] parts = status.split(" ", 3);
+        if (parts.length < 2) throw new IOException("Malformed RTSP response: " + status);
+        try {
+            int code = Integer.parseInt(parts[1]);
+            if (code < 200 || code >= 300) throw new IOException("RTSP error: " + status.trim());
+        } catch (NumberFormatException e) {
+            throw new IOException("Malformed RTSP status code: " + status);
+        }
+
+        // read remaining headers until the blank separator line
+        String found = null;
+        String line;
+        while ((line = readLine(in)) != null && !line.isEmpty()) {
+            Log.i(TAG, line);
+            if (targetHeader != null && line.startsWith(targetHeader)) {
+                // extract value, stripping optional parameters (e.g. "Session: abc;timeout=60")
+                found = line.substring(targetHeader.length()).split(";")[0].trim();
+            }
+        }
+        return found;
+    }
+
     private void rtspConnect() throws Exception {
         nalSize = 0; // discard any partial NAL fragment from the previous session
         Uri uri = Uri.parse(mHost);
@@ -615,7 +675,9 @@ public class Decoder extends Activity {
             int port = uri.getPort();
             s.connect(new InetSocketAddress(uri.getHost(), port < 0 ? 554 : port), 1000);
             s.setSoTimeout(1000);
-            BufferedReader r = new BufferedReader(new InputStreamReader(s.getInputStream()));
+            // use the raw InputStream — a BufferedReader would pre-read RTP stream bytes
+            // into its internal buffer, making them unavailable to tcpStream()
+            InputStream input = s.getInputStream();
             OutputStream w = s.getOutputStream();
 
             Log.d(TAG, "Start rtsp connection");
@@ -633,23 +695,19 @@ public class Decoder extends Activity {
             w.write(desc.getBytes(StandardCharsets.UTF_8));
             w.flush();
 
-            String line;
-            int descContentLength = 0;
-            while ((line = r.readLine()) != null && !line.isEmpty()) {
-                if (line.startsWith("Content-Length:")) {
-                    // capture body size so we can skip the SDP body below
-                    try { descContentLength = Integer.parseInt(line.substring(15).trim()); }
-                    catch (NumberFormatException ignored) {}
-                }
-                Log.i(TAG, line);
+            // read DESCRIBE response; capture Content-Length to skip the SDP body
+            String contentLenStr = readRtspResponse(input, "Content-Length:");
+            int sdpBodyLen = 0;
+            if (contentLenStr != null) {
+                try { sdpBodyLen = Integer.parseInt(contentLenStr); }
+                catch (NumberFormatException ignored) {}
             }
-            // consume the SDP body — leaving it unread would poison SETUP response parsing.
-            // skip() may return fewer bytes than requested, so loop until fully consumed.
-            long remaining = descContentLength;
-            while (remaining > 0) {
-                long skipped = r.skip(remaining);
-                if (skipped <= 0) break; // EOF or stream error
-                remaining -= skipped;
+            // consume SDP body so it does not pollute the SETUP response
+            byte[] skipBuf = new byte[512];
+            while (sdpBodyLen > 0) {
+                int n = input.read(skipBuf, 0, Math.min(sdpBodyLen, skipBuf.length));
+                if (n == -1) break;
+                sdpBodyLen -= n;
             }
 
             seq++;
@@ -660,14 +718,8 @@ public class Decoder extends Activity {
             w.write(video.getBytes(StandardCharsets.UTF_8));
             w.flush();
 
-            String session = null;
-            while ((line = r.readLine()) != null && !line.isEmpty()) {
-                if (line.startsWith("Session:")) {
-                    session = line.replace("Session:", "").split(";")[0].trim();
-                }
-                Log.i(TAG, line);
-            }
-
+            // read SETUP response; Session header is required to continue
+            String session = readRtspResponse(input, "Session:");
             if (session == null) {
                 throw new IOException("RTSP server did not return a Session header");
             }
@@ -681,9 +733,7 @@ public class Decoder extends Activity {
             w.write(audio.getBytes(StandardCharsets.UTF_8));
             w.flush();
 
-            while ((line = r.readLine()) != null && !line.isEmpty()) {
-                Log.i(TAG, line);
-            }
+            readRtspResponse(input, null);
 
             seq++;
             String play = "PLAY " + mHost + " RTSP/1.0\r\n" +
@@ -691,9 +741,7 @@ public class Decoder extends Activity {
             w.write(play.getBytes(StandardCharsets.UTF_8));
             w.flush();
 
-            while ((line = r.readLine()) != null && !line.isEmpty()) {
-                Log.i(TAG, line);
-            }
+            readRtspResponse(input, null);
 
             // disable read timeout before streaming: keyframe intervals often exceed 1 second
             s.setSoTimeout(0);
@@ -706,7 +754,8 @@ public class Decoder extends Activity {
                     udpStream(d);
                 }
             } else {
-                tcpStream(s.getInputStream());
+                // pass the same InputStream used for handshake — no bytes are lost
+                tcpStream(input);
             }
         }
     }
