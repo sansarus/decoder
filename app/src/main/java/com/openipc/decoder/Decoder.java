@@ -363,7 +363,8 @@ public class Decoder extends Activity {
         // camera slot selector: horizontal row [1] [2] [3] [4]
         LinearLayout camRow = new LinearLayout(this);
         camRow.setOrientation(LinearLayout.HORIZONTAL);
-        layout.addView(camRow);
+        layout.addView(camRow, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
 
         LinearLayout header = new LinearLayout(this);
         header.setOrientation(LinearLayout.VERTICAL);
@@ -398,8 +399,9 @@ public class Decoder extends Activity {
             final int slot = i;
             camButtons[i] = createItem(String.valueOf(i + 1));
             camButtons[i].setGravity(Gravity.CENTER);
-            camButtons[i].setMinWidth(dp(48));
-            camRow.addView(camButtons[i]);
+            LinearLayout.LayoutParams camBtnParams = new LinearLayout.LayoutParams(
+                    0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+            camRow.addView(camButtons[i], camBtnParams);
 
             if (i == mActive) highlightItem(camButtons[i]);
 
