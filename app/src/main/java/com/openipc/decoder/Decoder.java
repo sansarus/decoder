@@ -52,6 +52,7 @@ import android.widget.LinearLayout;
 import android.widget.PopupWindow;
 import android.widget.TextView;
 
+import java.io.BufferedInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -69,7 +70,6 @@ import java.util.concurrent.TimeUnit;
 
 public class Decoder extends Activity {
     private static final String TAG = "OpenIPCDecoder";
-    private static final String UA  = "User-Agent: OpenIPC-Decoder/1.0\r\n";
     private final BlockingQueue<Frame> nalQueue = new ArrayBlockingQueue<>(32);
     private final BlockingQueue<Frame> pcmQueue = new ArrayBlockingQueue<>(32);
     private final byte[] nalBuffer = new byte[1024 * 1024];
@@ -108,6 +108,7 @@ public class Decoder extends Activity {
     // held so onPause() can close them to unblock blocking read()/receive() on the network thread
     private volatile Socket mTcpSocket;
     private volatile DatagramSocket mUdpSocket;
+    private volatile DatagramSocket mUdpAudioSocket;
 
     // pre-allocated to avoid per-frame GC pressure in the video decode loop
     private final MediaCodec.BufferInfo mBufferInfo = new MediaCodec.BufferInfo();
@@ -120,6 +121,8 @@ public class Decoder extends Activity {
     // read from the network thread, written from the UI thread
     private volatile String mHost;
     private volatile boolean mType;
+    private String mVersion = "1.0";
+    private String mUserAgent = "User-Agent: OpenIPC-Decoder/1.0\r\n";
 
     // tracks last warned unknown RTP payload type to suppress log spam on the network thread
     private int lastUnknownPayload = -1; // only accessed on the network thread — no volatile needed
@@ -155,6 +158,18 @@ public class Decoder extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.decoder);
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                mVersion = getPackageManager()
+                        .getPackageInfo(getPackageName(), PackageManager.PackageInfoFlags.of(0))
+                        .versionName;
+            } else {
+                //noinspection deprecation
+                mVersion = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+            }
+        } catch (PackageManager.NameNotFoundException ignored) {}
+        mUserAgent = "User-Agent: OpenIPC-Decoder/" + mVersion + "\r\n";
 
         mSurface = findViewById(R.id.video_surface);
         mSurface.setKeepScreenOn(true);
@@ -202,10 +217,12 @@ public class Decoder extends Activity {
         mHost = pref.getString("host", "rtsp://root:12345@192.168.1.10:554/stream=0");
         mType = pref.getBoolean("type", false); // false = TCP (default), true = UDP
 
-        String link = getIntent().getStringExtra(Intent.EXTRA_TEXT);
+        Intent intent = getIntent();
+        String link = intent.getStringExtra(Intent.EXTRA_TEXT);
         if (link != null) {
             Log.d(TAG, "Link: " + Uri.parse(link).getHost()); // host only, never credentials
             mHost = sanitizeUrl(link);
+            intent.removeExtra(Intent.EXTRA_TEXT); // consume once to avoid overriding user edits
         }
     }
 
@@ -229,6 +246,8 @@ public class Decoder extends Activity {
         if (tcp != null) try { tcp.close(); } catch (Exception ignored) {}
         DatagramSocket udp = mUdpSocket;
         if (udp != null) try { udp.close(); } catch (Exception ignored) {}
+        DatagramSocket udpAudio = mUdpAudioSocket;
+        if (udpAudio != null) try { udpAudio.close(); } catch (Exception ignored) {}
     }
 
     private void createMenu(View menu) {
@@ -275,21 +294,7 @@ public class Decoder extends Activity {
             popup.dismiss();
         });
 
-        String code = "Exit [V1.0]";
-        try {
-            String name;
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                name = getPackageManager()
-                        .getPackageInfo(getPackageName(), PackageManager.PackageInfoFlags.of(0))
-                        .versionName;
-            } else {
-                //noinspection deprecation
-                name = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
-            }
-            code = "Exit [V" + name + "]";
-        } catch (PackageManager.NameNotFoundException e) {
-            Log.w(TAG, "Cannot extract version code");
-        }
+        String code = "Exit [V" + mVersion + "]";
 
         SpannableString s = new SpannableString(code);
         s.setSpan(new SuperscriptSpan(),    5, s.length(), 0); // "[V...]" raised, excluding leading space
@@ -374,13 +379,15 @@ public class Decoder extends Activity {
             @Override
             public void onReceivedHttpAuthRequest(
                     WebView view, HttpAuthHandler handler, String host, String realm) {
-                String mUser = Uri.parse(mHost).getUserInfo();
-                if (mUser != null) {
-                    String[] part = mUser.split(":", 2);
-                    if (part.length > 1) {
+                String userInfo = Uri.parse(mHost).getUserInfo();
+                if (userInfo != null) {
+                    String[] part = userInfo.split(":", 2);
+                    if (part.length == 2) {
                         handler.proceed(part[0], part[1]);
+                        return;
                     }
                 }
+                handler.cancel();
             }
         });
 
@@ -972,7 +979,7 @@ public class Decoder extends Activity {
 
             int seq = 1;
             String desc = "DESCRIBE " + rtspUrl + " RTSP/1.0\r\n" +
-                    "CSeq: " + seq + "\r\n" + auth + UA + "Accept: application/sdp\r\n\r\n";
+                    "CSeq: " + seq + "\r\n" + auth + mUserAgent + "Accept: application/sdp\r\n\r\n";
             w.write(desc.getBytes(StandardCharsets.UTF_8));
             w.flush();
 
@@ -1000,7 +1007,7 @@ public class Decoder extends Activity {
             String type = mType ? "RTP/AVP/UDP;unicast;client_port=5000"
                     : "RTP/AVP/TCP;unicast;interleaved=0-1";
             String video = "SETUP " + trackUrls[0] + " RTSP/1.0\r\n" +
-                    "CSeq: " + seq + "\r\n" + auth + UA + "Transport: " + type + "\r\n\r\n";
+                    "CSeq: " + seq + "\r\n" + auth + mUserAgent + "Transport: " + type + "\r\n\r\n";
             w.write(video.getBytes(StandardCharsets.UTF_8));
             w.flush();
 
@@ -1016,7 +1023,7 @@ public class Decoder extends Activity {
             type = mType ? "RTP/AVP/UDP;unicast;client_port=5002"
                     : "RTP/AVP/TCP;unicast;interleaved=2-3";
             String audio = "SETUP " + trackUrls[1] + " RTSP/1.0\r\n" +
-                    "CSeq: " + seq + "\r\n" + auth + UA + "Transport: " + type + "\r\n" +
+                    "CSeq: " + seq + "\r\n" + auth + mUserAgent + "Transport: " + type + "\r\n" +
                     "Session: " + session + "\r\n\r\n";
             w.write(audio.getBytes(StandardCharsets.UTF_8));
             w.flush();
@@ -1025,7 +1032,7 @@ public class Decoder extends Activity {
 
             seq++;
             String play = "PLAY " + rtspUrl + " RTSP/1.0\r\n" +
-                    "CSeq: " + seq + "\r\n" + auth + UA + "Session: " + session + "\r\n\r\n";
+                    "CSeq: " + seq + "\r\n" + auth + mUserAgent + "Session: " + session + "\r\n\r\n";
             w.write(play.getBytes(StandardCharsets.UTF_8));
             w.flush();
 
@@ -1042,12 +1049,20 @@ public class Decoder extends Activity {
             createDecoder();
             try {
                 if (mType) {
-                    try (DatagramSocket d = new DatagramSocket(5000)) {
-                        mUdpSocket = d; // stored so onPause() can close it to unblock receive()
+                    try (DatagramSocket video = new DatagramSocket(5000);
+                         DatagramSocket audio = new DatagramSocket(5002)) {
+                        mUdpSocket = video;
+                        mUdpAudioSocket = audio;
                         try {
-                            udpStream(d);
+                            // receive audio on a separate UDP socket in its own thread
+                            Thread audioRx = new Thread(() -> {
+                                try { udpStream(audio); } catch (IOException ignored) {}
+                            }, "rtsp-udp-audio");
+                            audioRx.start();
+                            udpStream(video);
                         } finally {
                             mUdpSocket = null;
+                            mUdpAudioSocket = null;
                         }
                     }
                 } else {
@@ -1064,7 +1079,7 @@ public class Decoder extends Activity {
                 // the socket was already closed by onPause()
                 try {
                     String teardown = "TEARDOWN " + rtspUrl + " RTSP/1.0\r\n" +
-                            "CSeq: " + (seq + 1) + "\r\n" + auth + UA +
+                            "CSeq: " + (seq + 1) + "\r\n" + auth + mUserAgent +
                             "Session: " + session + "\r\n\r\n";
                     w.write(teardown.getBytes(StandardCharsets.UTF_8));
                     w.flush();
@@ -1091,8 +1106,9 @@ public class Decoder extends Activity {
         }
     }
 
-    private void tcpStream(InputStream input) throws IOException {
-        // single read buffer reused for every RTSP interleaved packet
+    private void tcpStream(InputStream rawInput) throws IOException {
+        // wrap in BufferedInputStream to batch OS-level reads
+        BufferedInputStream input = new BufferedInputStream(rawInput, 65536);
         byte[] pktBuf = new byte[65535];
         while (activeStream) {
             int b = input.read();
@@ -1280,6 +1296,8 @@ public class Decoder extends Activity {
             if (tcp != null) try { tcp.close(); } catch (Exception ignored) {}
             DatagramSocket udp = mUdpSocket;
             if (udp != null) try { udp.close(); } catch (Exception ignored) {}
+            DatagramSocket udpAudio = mUdpAudioSocket;
+            if (udpAudio != null) try { udpAudio.close(); } catch (Exception ignored) {}
             closeDecoder();
             closeAudio();
             // discard stale frames so the new session starts with a clean slate

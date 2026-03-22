@@ -22,21 +22,14 @@ android {
         versionName "1.07"
     }
 
-    // Helper: fail at configuration time with a clear message if a required env var is absent.
-    // error() is Kotlin DSL only — use GradleException for Groovy build scripts.
-    def requireEnv = { String name ->
-        def v = System.getenv(name)
-        if (!v) throw new GradleException("Required environment variable '${name}' is not set")
-        return v
-    }
-
+    // Signing credentials from environment variables; null when absent.
+    // Debug builds ignore this config; release builds fail at signing time.
     signingConfigs {
         create("release") {
             storeFile file("../key.jks")
-            // Credentials must be provided via environment variables — never hardcode secrets.
-            storePassword requireEnv("KEYSTORE_PASS")
-            keyAlias      requireEnv("KEY_ALIAS")
-            keyPassword   requireEnv("KEY_PASS")
+            storePassword System.getenv("KEYSTORE_PASS")
+            keyAlias      System.getenv("KEY_ALIAS")
+            keyPassword   System.getenv("KEY_PASS")
         }
     }
 
@@ -44,6 +37,7 @@ android {
         release {
             minifyEnabled = true
             shrinkResources = true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt')
             signingConfig = signingConfigs.release
         }
     }
