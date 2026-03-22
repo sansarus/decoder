@@ -398,7 +398,9 @@ public class Decoder extends Activity {
             final int slot = i;
             camButtons[i] = createItem(String.valueOf(i + 1));
             camButtons[i].setGravity(Gravity.CENTER);
-            camButtons[i].setPadding(dp(8), dp(4), dp(8), dp(4));
+            camButtons[i].setPadding(dp(4), dp(4), dp(4), dp(4));
+            camButtons[i].setMinimumWidth(0);
+            camButtons[i].setMinWidth(0);
             camRow.addView(camButtons[i]);
 
             if (i == mActive) highlightItem(camButtons[i]);
@@ -453,7 +455,7 @@ public class Decoder extends Activity {
     private TextView createItem(String title) {
         TextView text = new TextView(this);
         text.setText(title);
-        text.setPadding(dp(8), dp(8), dp(8), dp(8));
+        text.setPadding(dp(8), dp(6), dp(8), dp(6));
         text.setTextColor(Color.WHITE);
         text.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
         focusChange(text);
@@ -484,7 +486,6 @@ public class Decoder extends Activity {
         text.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
         text.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         text.setSingleLine(true);
-        text.setMinWidth(dp(250));
         text.setImeOptions(EditorInfo.IME_ACTION_DONE);
         text.setSelection(text.getText().length());
         focusChange(text);
