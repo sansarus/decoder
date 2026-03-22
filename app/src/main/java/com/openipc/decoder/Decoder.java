@@ -881,7 +881,10 @@ public class Decoder extends Activity {
             }
             // Strip userinfo from the request-line URL: credentials belong only in the
             // Authorization header — including them in the URL leaks them to server access logs.
-            String rtspUrl = uri.buildUpon().userInfo(null).build().toString();
+            String path = uri.getEncodedPath();
+            String rtspUrl = uri.getScheme() + "://" + host
+                    + (port >= 0 ? ":" + port : "")
+                    + (path != null ? path : "");
 
             int seq = 1;
             String desc = "DESCRIBE " + rtspUrl + " RTSP/1.0\r\n" +
