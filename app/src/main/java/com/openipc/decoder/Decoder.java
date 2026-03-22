@@ -66,6 +66,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.Locale;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 public class Decoder extends Activity {
@@ -132,11 +134,9 @@ public class Decoder extends Activity {
     private static final int RTP_FU_H265  = 49;  // H.265 FU
 
     // RTP dynamic payload types as negotiated in the OpenIPC camera SDP
-    private static final int RTP_PT_PCMU  = 100; // audio (dynamic, typically 16-bit PCM)
-    private static final int RTP_PT_AAC   = 99;  // AAC audio (unsupported)
-    private static final int RTP_PT_OPUS  = 98;  // Opus audio (unsupported)
     private static final int RTP_PT_H265  = 97;  // H.265/HEVC video
     private static final int RTP_PT_H264  = 96;  // H.264/AVC video
+    private static final int RTP_PT_PCMU_DEFAULT = 100; // fallback audio PT
 
     // Parameter-set NAL types used to set BUFFER_FLAG_CODEC_CONFIG on the decoder input
     private static final int H265_NAL_VPS = 32;  // Video Parameter Set
@@ -151,8 +151,16 @@ public class Decoder extends Activity {
     // audio clock rate parsed from SDP rtpmap; falls back to 8000 Hz if SDP is absent
     private volatile int audioSampleRate = 8000;
 
+    // audio payload type parsed from SDP m=audio; defaults to the OpenIPC convention
+    private volatile int audioPt = RTP_PT_PCMU_DEFAULT;
+
+    // L16 encoding is big-endian per RFC 3551; set false for native-endian encodings
+    private volatile boolean audioBigEndian = true;
+
     // reference kept so we can dismiss the dialog (and destroy the WebView) on rotation
     private Dialog mBrowserDialog; // only accessed on the UI thread — no volatile needed
+
+    private ExecutorService executor; // only accessed on the UI thread — no volatile needed
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -603,10 +611,13 @@ public class Decoder extends Activity {
         // fall back to heap allocation only for unusually large frames
         byte[] data = (length <= PCM_BUF_SIZE) ? pcmStagingBuf : new byte[length];
         System.arraycopy(frame.data(), header, data, 0, length);
-        for (int i = 0; i + 1 < length; i += 2) { // guard against odd-length frames
-            byte tmp = data[i];
-            data[i] = data[i + 1];
-            data[i + 1] = tmp;
+        // swap bytes only for big-endian encodings (L16 per RFC 3551)
+        if (audioBigEndian) {
+            for (int i = 0; i + 1 < length; i += 2) {
+                byte tmp = data[i];
+                data[i] = data[i + 1];
+                data[i + 1] = tmp;
+            }
         }
 
         // must copy into a fresh array before queuing — pcmStagingBuf is overwritten next call
@@ -816,23 +827,21 @@ public class Decoder extends Activity {
     }
 
     private void closeDecoder() {
-        MediaCodec codec;
         synchronized (decoderLock) {
-            codec = mDecoder;
+            MediaCodec codec = mDecoder;
             if (codec == null) { decoderFailed = false; return; }
-            // null first so decodeFrame() sees null as soon as possible
             mDecoder = null;
+            Log.i(TAG, "Close video decoder");
+            // release inside the lock: prevents createDecoder() from allocating a second
+            // codec instance while the old one is still held by the hardware pipeline
+            try {
+                codec.stop();
+                codec.release();
+            } catch (Exception e) {
+                Log.e(TAG, "Decoder close exception", e);
+            }
+            decoderFailed = false;
         }
-        Log.i(TAG, "Close video decoder");
-        // stop()/release() outside the lock so we don't block other threads while
-        // the driver tears down the hardware codec pipeline
-        try {
-            codec.stop();
-            codec.release();
-        } catch (Exception e) {
-            Log.e(TAG, "Decoder close exception", e);
-        }
-        decoderFailed = false; // allow re-init on the next RTSP session
     }
 
     /**
@@ -900,14 +909,13 @@ public class Decoder extends Activity {
      * against {@code baseUrl}. Falls back to "{@code baseUrl}/trackID=N" if absent.
      */
     private String[] parseSdp(String sdp, String baseUrl) {
-        String[] controls = { baseUrl + "/trackID=0", baseUrl + "/trackID=1" };
-        String audioPtPrefix = "a=rtpmap:" + RTP_PT_PCMU + " ";
+        String base = baseUrl; // may be overridden by session-level a=control:
+        String[] controls = { null, null };
         int track = -1; // -1 = session section, 0 = video, 1 = audio
 
         for (String line : sdp.split("[\r\n]+")) {
             if (line.startsWith("m=video")) {
                 track = 0;
-                // "m=video <port> RTP/AVP <pt> [...]" — first payload type determines codec
                 String[] parts = line.split("\\s+");
                 if (parts.length >= 4) {
                     try {
@@ -919,27 +927,45 @@ public class Decoder extends Activity {
                 }
             } else if (line.startsWith("m=audio")) {
                 track = 1;
-            } else if (line.startsWith("a=control:") && track >= 0) {
+                // parse audio payload type from "m=audio <port> RTP/AVP <pt>"
+                String[] parts = line.split("\\s+");
+                if (parts.length >= 4) {
+                    try {
+                        audioPt = Integer.parseInt(parts[3]);
+                        Log.d(TAG, "SDP audio PT: " + audioPt);
+                    } catch (NumberFormatException ignored) {}
+                }
+            } else if (line.startsWith("a=control:")) {
                 String ctrl = line.substring("a=control:".length()).trim();
-                // absolute URL used as-is; relative URL appended to base
-                controls[track] = ctrl.startsWith("rtsp://") ? ctrl : baseUrl + "/" + ctrl;
-            } else if (line.startsWith(audioPtPrefix)) {
-                int slash = line.indexOf('/', audioPtPrefix.length());
+                if (track == -1) {
+                    // session-level control: override base URL (RFC 2326 §C.1.1)
+                    base = ctrl.startsWith("rtsp://") ? ctrl : baseUrl + "/" + ctrl;
+                } else {
+                    controls[track] = ctrl.startsWith("rtsp://") ? ctrl : base + "/" + ctrl;
+                }
+            } else if (audioPt >= 0 && line.startsWith("a=rtpmap:" + audioPt + " ")) {
+                String encoding = line.substring(("a=rtpmap:" + audioPt + " ").length());
+                audioBigEndian = encoding.toUpperCase(Locale.ROOT).startsWith("L16");
+                int slash = encoding.indexOf('/');
                 if (slash >= 0) {
-                    int end = line.indexOf('/', slash + 1);
+                    int end = encoding.indexOf('/', slash + 1);
                     String rateStr = (end >= 0
-                            ? line.substring(slash + 1, end)
-                            : line.substring(slash + 1)).trim();
+                            ? encoding.substring(slash + 1, end)
+                            : encoding.substring(slash + 1)).trim();
                     try {
                         int rate = Integer.parseInt(rateStr);
                         if (rate > 0 && rate <= 192000) {
                             audioSampleRate = rate;
-                            Log.d(TAG, "Audio sample rate from SDP: " + rate + " Hz");
+                            Log.d(TAG, "Audio: " + encoding.split("/")[0]
+                                    + " " + rate + " Hz, BE=" + audioBigEndian);
                         }
                     } catch (NumberFormatException ignored) {}
                 }
             }
         }
+        // apply defaults for tracks without explicit control
+        if (controls[0] == null) controls[0] = base + "/trackID=0";
+        if (controls[1] == null) controls[1] = base + "/trackID=1";
         return controls;
     }
 
@@ -1003,8 +1029,18 @@ public class Decoder extends Activity {
             // single-pass SDP parse: audio rate, video codec, and per-track Control URLs
             String[] trackUrls = parseSdp(sdp.toString(), rtspUrl);
 
+            // bind to ephemeral ports before SETUP to advertise in Transport header
+            DatagramSocket udpVideo = null;
+            DatagramSocket udpAudio = null;
+            if (mType) {
+                udpVideo = new DatagramSocket(0);
+                udpAudio = new DatagramSocket(0);
+            }
+            try {
+
             seq++;
-            String type = mType ? "RTP/AVP/UDP;unicast;client_port=5000"
+            String type = mType
+                    ? "RTP/AVP/UDP;unicast;client_port=" + udpVideo.getLocalPort()
                     : "RTP/AVP/TCP;unicast;interleaved=0-1";
             String video = "SETUP " + trackUrls[0] + " RTSP/1.0\r\n" +
                     "CSeq: " + seq + "\r\n" + auth + mUserAgent + "Transport: " + type + "\r\n\r\n";
@@ -1020,7 +1056,8 @@ public class Decoder extends Activity {
             session = session.replaceAll("[\r\n]", "");
 
             seq++;
-            type = mType ? "RTP/AVP/UDP;unicast;client_port=5002"
+            type = mType
+                    ? "RTP/AVP/UDP;unicast;client_port=" + udpAudio.getLocalPort()
                     : "RTP/AVP/TCP;unicast;interleaved=2-3";
             String audio = "SETUP " + trackUrls[1] + " RTSP/1.0\r\n" +
                     "CSeq: " + seq + "\r\n" + auth + mUserAgent + "Transport: " + type + "\r\n" +
@@ -1049,34 +1086,27 @@ public class Decoder extends Activity {
             createDecoder();
             try {
                 if (mType) {
-                    try (DatagramSocket video = new DatagramSocket(5000);
-                         DatagramSocket audio = new DatagramSocket(5002)) {
-                        mUdpSocket = video;
-                        mUdpAudioSocket = audio;
-                        try {
-                            // receive audio on a separate UDP socket in its own thread
-                            Thread audioRx = new Thread(() -> {
-                                try { udpStream(audio); } catch (IOException ignored) {}
-                            }, "rtsp-udp-audio");
-                            audioRx.start();
-                            udpStream(video);
-                        } finally {
-                            mUdpSocket = null;
-                            mUdpAudioSocket = null;
-                        }
+                    mUdpSocket = udpVideo;
+                    mUdpAudioSocket = udpAudio;
+                    try {
+                        Thread audioRx = new Thread(() -> {
+                            try { udpStream(udpAudio); } catch (IOException ignored) {}
+                        }, "rtsp-udp-audio");
+                        audioRx.start();
+                        udpStream(udpVideo);
+                    } finally {
+                        mUdpSocket = null;
+                        mUdpAudioSocket = null;
                     }
                 } else {
-                    mTcpSocket = s; // stored so onPause() can close it to unblock read()
+                    mTcpSocket = s;
                     try {
-                        // pass the same InputStream used for handshake — no bytes are lost
                         tcpStream(input);
                     } finally {
                         mTcpSocket = null;
                     }
                 }
             } finally {
-                // tell the server to release the session; best-effort — ignore errors if
-                // the socket was already closed by onPause()
                 try {
                     String teardown = "TEARDOWN " + rtspUrl + " RTSP/1.0\r\n" +
                             "CSeq: " + (seq + 1) + "\r\n" + auth + mUserAgent +
@@ -1085,6 +1115,11 @@ public class Decoder extends Activity {
                     w.flush();
                     Log.d(TAG, "RTSP TEARDOWN sent");
                 } catch (Exception ignored) {}
+            }
+
+            } finally {
+                if (udpVideo != null) try { udpVideo.close(); } catch (Exception ignored) {}
+                if (udpAudio != null) try { udpAudio.close(); } catch (Exception ignored) {}
             }
         }
     }
@@ -1102,7 +1137,10 @@ public class Decoder extends Activity {
             } catch (SocketTimeoutException ignored) {
                 continue; // re-check activeStream
             }
-            processPacket(new Frame(packet.getData(), packet.getLength()));
+            // defensive copy: packet.getData() is reused on next receive()
+            byte[] copy = new byte[packet.getLength()];
+            System.arraycopy(packet.getData(), 0, copy, 0, packet.getLength());
+            processPacket(new Frame(copy, packet.getLength()));
         }
     }
 
@@ -1164,13 +1202,9 @@ public class Decoder extends Activity {
         }
 
         int payload = (data[1] & 0x7F);
-        if (payload == RTP_PT_PCMU) {
+        if (payload == audioPt) {
             processAudio(frame);
             return;
-        } else if (payload == RTP_PT_AAC) {
-            return; // AAC not supported
-        } else if (payload == RTP_PT_OPUS) {
-            return; // Opus not supported
         } else if (payload == RTP_PT_H265 || payload == RTP_PT_H264) {
             codecH265 = payload == RTP_PT_H265;
             Frame output = buildFrame(frame);
@@ -1204,7 +1238,10 @@ public class Decoder extends Activity {
         // increments listenerGen, preventing duplicate threads on resume.
         final int gen = listenerGen;
 
-        new Thread(() -> {
+        executor = Executors.newFixedThreadPool(4);
+
+        executor.execute(() -> {
+            Thread.currentThread().setName("rtsp-network");
             int retryDelay = 1000; // start at 1 s, doubles up to 8 s on repeated failures
             while (gen == listenerGen) {
                 try {
@@ -1226,9 +1263,10 @@ public class Decoder extends Activity {
                     retryDelay = Math.min(retryDelay * 2, 8000);
                 }
             }
-        }, "rtsp-network").start();
+        });
 
-        new Thread(() -> {
+        executor.execute(() -> {
+            Thread.currentThread().setName("rtsp-watchdog");
             while (gen == listenerGen) {
                 if (activeStream) {
                     if (SystemClock.elapsedRealtime() - lastFrame > WATCHDOG_MS) {
@@ -1243,9 +1281,10 @@ public class Decoder extends Activity {
                 }
                 SystemClock.sleep(1000);
             }
-        }, "rtsp-watchdog").start();
+        });
 
-        new Thread(() -> {
+        executor.execute(() -> {
+            Thread.currentThread().setName("rtsp-video");
             while (gen == listenerGen) {
                 try {
                     Frame buffer = nalQueue.poll(5, TimeUnit.MILLISECONDS);
@@ -1259,9 +1298,10 @@ public class Decoder extends Activity {
                     Log.e(TAG, "Video decode error: " + e.getMessage());
                 }
             }
-        }, "rtsp-video").start();
+        });
 
-        new Thread(() -> {
+        executor.execute(() -> {
+            Thread.currentThread().setName("rtsp-audio");
             while (gen == listenerGen) {
                 try {
                     Frame buffer = pcmQueue.poll(5, TimeUnit.MILLISECONDS);
@@ -1275,7 +1315,7 @@ public class Decoder extends Activity {
                     Log.e(TAG, "Audio playback error: " + e.getMessage());
                 }
             }
-        }, "rtsp-audio").start();
+        });
     }
 
     @Override
@@ -1298,6 +1338,10 @@ public class Decoder extends Activity {
             if (udp != null) try { udp.close(); } catch (Exception ignored) {}
             DatagramSocket udpAudio = mUdpAudioSocket;
             if (udpAudio != null) try { udpAudio.close(); } catch (Exception ignored) {}
+            if (executor != null) {
+                executor.shutdownNow();
+                executor = null;
+            }
             closeDecoder();
             closeAudio();
             // discard stale frames so the new session starts with a clean slate
