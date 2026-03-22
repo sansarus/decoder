@@ -122,7 +122,7 @@ public class Decoder extends Activity {
 
     // read from the network thread, written from the UI thread
     private static final int CAM_COUNT = 4;
-    private static final String DEFAULT_URL = "rtsp://root:123456@192.168.1.10:554/stream=0";
+    private static final String DEFAULT_URL = "rtsp://root:12345@192.168.1.10:554/stream=0";
     private final String[] mHosts = new String[CAM_COUNT];
     private final boolean[] mTypes = new boolean[CAM_COUNT]; // false = TCP, true = UDP
     private int mActive; // only accessed on the UI thread — no volatile needed
