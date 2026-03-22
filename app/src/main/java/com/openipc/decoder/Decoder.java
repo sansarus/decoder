@@ -455,9 +455,9 @@ public class Decoder extends Activity {
     private TextView createItem(String title) {
         TextView text = new TextView(this);
         text.setText(title);
-        text.setPadding(dp(12), dp(12), dp(12), dp(12));
+        text.setPadding(dp(8), dp(8), dp(8), dp(8));
         text.setTextColor(Color.WHITE);
-        text.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
+        text.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
         focusChange(text);
 
         return text;
@@ -481,10 +481,9 @@ public class Decoder extends Activity {
     private EditText createEdit(String title) {
         EditText text = new EditText(this);
         text.setText(title);
-        text.setPadding(dp(12), dp(12), dp(12), dp(12));
+        text.setPadding(dp(8), dp(8), dp(8), dp(8));
         text.setTextColor(Color.WHITE);
-        text.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
-        // TYPE_TEXT_VARIATION_URI shows the text normally (not masked like a password)
+        text.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
         text.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         text.setImeOptions(EditorInfo.IME_ACTION_DONE);
         text.setSelection(text.getText().length());
