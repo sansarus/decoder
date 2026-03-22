@@ -18,8 +18,8 @@ android {
         applicationId "com.openipc.decoder"
         minSdk 21
         targetSdk 36
-        versionCode 7
-        versionName "1.07"
+        versionCode 8
+        versionName "1.08"
     }
 
     // Signing credentials from environment variables; null when absent.
