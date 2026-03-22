@@ -133,7 +133,7 @@ public class Decoder extends Activity {
     private final byte[] pcmStagingBuf = new byte[PCM_BUF_SIZE];
 
     // read from the network thread, written from the UI thread
-    private static final int CAM_COUNT = 4;
+    private static final int CAM_COUNT = 8;
     private static final String DEFAULT_URL = "rtsp://root:12345@192.168.1.10:554/stream=0";
     private final String[] mHosts = new String[CAM_COUNT];
     private final boolean[] mTypes = new boolean[CAM_COUNT]; // false = TCP, true = UDP
@@ -322,7 +322,7 @@ public class Decoder extends Activity {
         resetZoom();
     }
 
-    /** Format the status text: "[N/4] url" or "Camera N — not configured". */
+    /** Format the status text: "[N/8] url" or "Camera N — not configured". */
     private String formatStatus() {
         String url = mHosts[mActive];
         if (url == null || url.isEmpty()) {
