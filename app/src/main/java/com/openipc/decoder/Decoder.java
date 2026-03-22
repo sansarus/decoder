@@ -35,8 +35,11 @@ import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.Surface;
-import android.view.SurfaceHolder;
-import android.view.SurfaceView;
+import android.graphics.Matrix;
+import android.view.GestureDetector;
+import android.view.MotionEvent;
+import android.view.ScaleGestureDetector;
+import android.view.TextureView;
 import android.view.View;
 import android.view.Window;
 import android.view.WindowInsets;
@@ -78,14 +81,23 @@ public class Decoder extends Activity {
 
     private int nalSize;            // only touched on the network thread — no volatile needed
     private volatile MediaCodec mDecoder;
-    // Surface captured on the UI thread via SurfaceHolder.Callback; volatile so the
+    // Surface captured on the UI thread via TextureView.SurfaceTextureListener; volatile so the
     // network thread can safely read it in createDecoder() without holding any UI lock
     private volatile Surface mVideoSurface;
     // guards all MediaCodec lifecycle operations (create / use / release) so that
     // closeDecoder() called from the network thread never races with decodeFrame()
     // called from the video thread
     private final Object decoderLock = new Object();
-    private SurfaceView mSurface;
+    private TextureView mSurface;
+
+    // Pinch-to-zoom and pan state
+    private ScaleGestureDetector mScaleDetector;
+    private GestureDetector mGestureDetector;
+    private float mZoomScale = 1.0f;
+    private float mPanX = 0f;
+    private float mPanY = 0f;
+    private static final float ZOOM_MIN = 1.0f;
+    private static final float ZOOM_MAX = 5.0f;
     private volatile AudioTrack audioTrack;
     private TextView mConnect;
 
@@ -186,12 +198,56 @@ public class Decoder extends Activity {
 
         mSurface = findViewById(R.id.video_surface);
         mSurface.setKeepScreenOn(true);
-        // capture the rendering Surface on the UI thread; network threads read mVideoSurface
-        // from createDecoder() — SurfaceHolder.getSurface() is not thread-safe to call directly
-        mSurface.getHolder().addCallback(new SurfaceHolder.Callback() {
-            @Override public void surfaceCreated(SurfaceHolder h)                    { mVideoSurface = h.getSurface(); }
-            @Override public void surfaceChanged(SurfaceHolder h, int f, int w, int hh) { mVideoSurface = h.getSurface(); }
-            @Override public void surfaceDestroyed(SurfaceHolder h)                  { mVideoSurface = null; }
+        // capture the rendering Surface on the UI thread via TextureView listener
+        mSurface.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
+            @Override public void onSurfaceTextureAvailable(android.graphics.SurfaceTexture st, int w, int h) {
+                mVideoSurface = new Surface(st);
+            }
+            @Override public void onSurfaceTextureSizeChanged(android.graphics.SurfaceTexture st, int w, int h) {
+                mVideoSurface = new Surface(st);
+            }
+            @Override public boolean onSurfaceTextureDestroyed(android.graphics.SurfaceTexture st) {
+                mVideoSurface = null;
+                return true;
+            }
+            @Override public void onSurfaceTextureUpdated(android.graphics.SurfaceTexture st) {}
+        });
+
+        // Pinch-to-zoom
+        mScaleDetector = new ScaleGestureDetector(this, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            @Override public boolean onScale(ScaleGestureDetector d) {
+                mZoomScale = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, mZoomScale * d.getScaleFactor()));
+                clampPan();
+                applyZoomTransform();
+                return true;
+            }
+        });
+        // Pan (scroll) and double-tap to reset zoom, single tap opens menu
+        final View menuAnchor = findViewById(R.id.decoder);
+        mGestureDetector = new GestureDetector(this, new GestureDetector.SimpleOnGestureListener() {
+            @Override public boolean onScroll(MotionEvent e1, MotionEvent e2, float dx, float dy) {
+                if (mZoomScale > ZOOM_MIN) {
+                    mPanX -= dx;
+                    mPanY -= dy;
+                    clampPan();
+                    applyZoomTransform();
+                    return true;
+                }
+                return false;
+            }
+            @Override public boolean onDoubleTap(MotionEvent e) {
+                resetZoom();
+                return true;
+            }
+            @Override public boolean onSingleTapConfirmed(MotionEvent e) {
+                createMenu(menuAnchor);
+                return true;
+            }
+        });
+        mSurface.setOnTouchListener((v, event) -> {
+            mScaleDetector.onTouchEvent(event);
+            mGestureDetector.onTouchEvent(event);
+            return true;
         });
         mConnect = findViewById(R.id.text_connect);
         mConnect.setTextColor(Color.LTGRAY);
@@ -210,8 +266,7 @@ public class Decoder extends Activity {
                     View.SYSTEM_UI_FLAG_HIDE_NAVIGATION);
         }
 
-        View menu = findViewById(R.id.decoder);
-        menu.setOnClickListener(item -> createMenu(menu));
+        // Menu is opened via single-tap in the gesture detector above
 
         Thread.setDefaultUncaughtExceptionHandler((thread, throwable) -> {
             Log.e(TAG, "Uncaught exception", throwable);
@@ -264,6 +319,7 @@ public class Decoder extends Activity {
     private void applyActiveCamera() {
         mHost = mHosts[mActive];
         mType = mTypes[mActive];
+        resetZoom();
     }
 
     /** Format the status text: "[N/4] url" or "Camera N — not configured". */
@@ -532,6 +588,32 @@ public class Decoder extends Activity {
             mSurface.setLayoutParams(params);
             mConnect.setVisibility(View.GONE);
         });
+    }
+
+    /** Apply current zoom scale and pan offset via TextureView matrix transform */
+    private void applyZoomTransform() {
+        Matrix matrix = new Matrix();
+        float cx = mSurface.getWidth() / 2f;
+        float cy = mSurface.getHeight() / 2f;
+        matrix.postScale(mZoomScale, mZoomScale, cx, cy);
+        matrix.postTranslate(mPanX, mPanY);
+        mSurface.setTransform(matrix);
+    }
+
+    /** Clamp pan offset so the image edges don't go past the viewport center */
+    private void clampPan() {
+        float maxX = (mSurface.getWidth() * (mZoomScale - 1)) / 2f;
+        float maxY = (mSurface.getHeight() * (mZoomScale - 1)) / 2f;
+        mPanX = Math.max(-maxX, Math.min(maxX, mPanX));
+        mPanY = Math.max(-maxY, Math.min(maxY, mPanY));
+    }
+
+    /** Reset zoom to default 1:1 view */
+    private void resetZoom() {
+        mZoomScale = ZOOM_MIN;
+        mPanX = 0f;
+        mPanY = 0f;
+        applyZoomTransform();
     }
 
     private int getFragment(byte data) {
@@ -865,7 +947,7 @@ public class Decoder extends Activity {
         }
 
         // use the Surface captured on the UI thread — getSurface() is not thread-safe to call
-        // from the network thread directly (the SurfaceHolder.Callback populates mVideoSurface)
+        // from the network thread directly (the TextureView listener populates mVideoSurface)
         Surface mVideo = mVideoSurface;
         if (mVideo == null || !mVideo.isValid()) {
             return;
