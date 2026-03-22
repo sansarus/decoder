@@ -304,6 +304,11 @@ public class Decoder extends Activity {
                 LinearLayout.LayoutParams.WRAP_CONTENT, true);
         popup.showAtLocation(menu, Gravity.TOP | Gravity.START, 0, dp(20));
 
+        // camera slot selector: horizontal row [1] [2] [3] [4]
+        LinearLayout camRow = new LinearLayout(this);
+        camRow.setOrientation(LinearLayout.HORIZONTAL);
+        layout.addView(camRow);
+
         LinearLayout header = new LinearLayout(this);
         header.setOrientation(LinearLayout.VERTICAL);
         header.setVisibility(View.GONE);
@@ -332,11 +337,6 @@ public class Decoder extends Activity {
             saveSettings();
         });
 
-        // camera slot selector: horizontal row [1] [2] [3] [4]
-        LinearLayout camRow = new LinearLayout(this);
-        camRow.setOrientation(LinearLayout.HORIZONTAL);
-        layout.addView(camRow);
-
         final TextView[] camButtons = new TextView[CAM_COUNT];
         for (int i = 0; i < CAM_COUNT; i++) {
             final int slot = i;
@@ -354,7 +354,6 @@ public class Decoder extends Activity {
                     if (j == mActive) highlightItem(camButtons[j]);
                     else resetItem(camButtons[j]);
                 }
-                // refresh the settings panel if it is open
                 host.setText(mHosts[mActive]);
                 host.setSelection(host.getText().length());
                 typeToggle.setText(mTypes[mActive] ? "Transport: UDP" : "Transport: TCP");
