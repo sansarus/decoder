@@ -73,7 +73,6 @@ public class Decoder extends Activity {
     private final BlockingQueue<Frame> pcmQueue = new ArrayBlockingQueue<>(32);
     private final byte[] nalBuffer = new byte[1024 * 1024];
 
-    // volatile: these fields are read/written from multiple threads
     private int nalSize;            // only touched on the network thread — no volatile needed
     private volatile MediaCodec mDecoder;
     private SurfaceView mSurface;
@@ -855,6 +854,27 @@ public class Decoder extends Activity {
         }
     }
 
+    /**
+     * Parses per-track Control URLs from an SDP body (RFC 2326 §C.1.1).
+     * Returns a 2-element array: [videoControlUrl, audioControlUrl].
+     * Absolute "a=control:" values are used as-is; relative values are resolved
+     * against {@code baseUrl}. Falls back to "{@code baseUrl}/trackID=N" if absent.
+     */
+    private static String[] parseSdpControls(String sdp, String baseUrl) {
+        String[] controls = { baseUrl + "/trackID=0", baseUrl + "/trackID=1" };
+        int track = -1;
+        for (String line : sdp.split("[\r\n]+")) {
+            if      (line.startsWith("m=video")) track = 0;
+            else if (line.startsWith("m=audio")) track = 1;
+            else if (line.startsWith("a=control:") && track >= 0) {
+                String ctrl = line.substring("a=control:".length()).trim();
+                // absolute URL used as-is; relative URL appended to base
+                controls[track] = ctrl.startsWith("rtsp://") ? ctrl : baseUrl + "/" + ctrl;
+            }
+        }
+        return controls;
+    }
+
     private void rtspConnect() throws Exception {
         nalSize = 0; // discard any partial NAL fragment from the previous session
         Uri uri = Uri.parse(mHost);
@@ -910,11 +930,13 @@ public class Decoder extends Activity {
                 sdpBodyLen -= n;
             }
             parseSdpAudioRate(sdp.toString());
+            // parse per-track Control URLs; used for SETUP requests below
+            String[] trackUrls = parseSdpControls(sdp.toString(), rtspUrl);
 
             seq++;
             String type = mType ? "RTP/AVP/UDP;unicast;client_port=5000"
                     : "RTP/AVP/TCP;unicast;interleaved=0-1";
-            String video = "SETUP " + rtspUrl + "/trackID=0 RTSP/1.0\r\n" +
+            String video = "SETUP " + trackUrls[0] + " RTSP/1.0\r\n" +
                     "CSeq: " + seq + "\r\n" + auth + UA + "Transport: " + type + "\r\n\r\n";
             w.write(video.getBytes(StandardCharsets.UTF_8));
             w.flush();
@@ -930,7 +952,7 @@ public class Decoder extends Activity {
             seq++;
             type = mType ? "RTP/AVP/UDP;unicast;client_port=5002"
                     : "RTP/AVP/TCP;unicast;interleaved=2-3";
-            String audio = "SETUP " + rtspUrl + "/trackID=1 RTSP/1.0\r\n" +
+            String audio = "SETUP " + trackUrls[1] + " RTSP/1.0\r\n" +
                     "CSeq: " + seq + "\r\n" + auth + UA + "Transport: " + type + "\r\n" +
                     "Session: " + session + "\r\n\r\n";
             w.write(audio.getBytes(StandardCharsets.UTF_8));
@@ -1107,7 +1129,10 @@ public class Decoder extends Activity {
                     if (!activeStream) {
                         runOnUiThread(() -> mConnect.setVisibility(View.VISIBLE));
                         rtspConnect();
-                        retryDelay = 1000; // reset on successful connection
+                        retryDelay = 1000; // reset backoff after any successful session
+                        // brief pause before reconnecting after a clean server-side close;
+                        // without this the loop hammers the camera with no delay
+                        SystemClock.sleep(1000);
                     }
                 } catch (Exception e) {
                     Log.w(TAG, "Cannot connect rtsp: " + e.getMessage());
