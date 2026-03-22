@@ -717,6 +717,8 @@ public class Decoder extends Activity {
     }
 
     private void createDecoder() {
+        if (mDecoder != null) return; // already running — avoid double-init and native leak
+
         Surface mVideo = mSurface.getHolder().getSurface();
         if (!mVideo.isValid()) {
             return;
@@ -855,6 +857,29 @@ public class Decoder extends Activity {
     }
 
     /**
+     * Detects the video codec from the SDP "m=video" line and updates {@link #codecH265}.
+     * Knowing the codec before the first RTP packet allows pre-warming the decoder immediately
+     * after PLAY, hiding the 200–500 ms MediaCodec startup cost behind network latency.
+     */
+    private void parseSdpVideoCodec(String sdp) {
+        for (String line : sdp.split("[\r\n]+")) {
+            if (line.startsWith("m=video")) {
+                // "m=video <port> RTP/AVP <pt> [...]" — first payload type determines codec
+                String[] parts = line.split("\\s+");
+                if (parts.length >= 4) {
+                    try {
+                        int pt = Integer.parseInt(parts[3]);
+                        codecH265 = (pt == RTP_PT_H265);
+                        Log.d(TAG, "SDP video codec: " + (codecH265 ? "H.265" : "H.264")
+                                + " (PT=" + pt + ")");
+                    } catch (NumberFormatException ignored) {}
+                }
+                break;
+            }
+        }
+    }
+
+    /**
      * Parses per-track Control URLs from an SDP body (RFC 2326 §C.1.1).
      * Returns a 2-element array: [videoControlUrl, audioControlUrl].
      * Absolute "a=control:" values are used as-is; relative values are resolved
@@ -930,6 +955,7 @@ public class Decoder extends Activity {
                 sdpBodyLen -= n;
             }
             parseSdpAudioRate(sdp.toString());
+            parseSdpVideoCodec(sdp.toString()); // detect codec early to pre-warm the decoder
             // parse per-track Control URLs; used for SETUP requests below
             String[] trackUrls = parseSdpControls(sdp.toString(), rtspUrl);
 
@@ -974,6 +1000,9 @@ public class Decoder extends Activity {
             // not from the epoch (lastFrame == 0 would trigger the watchdog immediately)
             lastFrame = SystemClock.elapsedRealtime();
             activeStream = true;
+            // pre-warm the decoder now, while first packets are still in transit;
+            // without this, createDecoder() runs on the first decoded frame (~200–500 ms later)
+            createDecoder();
             try {
                 if (mType) {
                     try (DatagramSocket d = new DatagramSocket(5000)) {
