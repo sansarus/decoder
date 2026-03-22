@@ -399,9 +399,8 @@ public class Decoder extends Activity {
             camButtons[i] = createItem(String.valueOf(i + 1));
             camButtons[i].setGravity(Gravity.CENTER);
             camButtons[i].setPadding(dp(4), dp(4), dp(4), dp(4));
-            camButtons[i].setMinimumWidth(0);
-            camButtons[i].setMinWidth(0);
-            camRow.addView(camButtons[i]);
+            camRow.addView(camButtons[i], new LinearLayout.LayoutParams(
+                    0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
             if (i == mActive) highlightItem(camButtons[i]);
 
