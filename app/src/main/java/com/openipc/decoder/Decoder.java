@@ -416,17 +416,18 @@ public class Decoder extends Activity {
             return;
         }
 
-        int surfaceH = mSurface.getHeight();
-        // surface may not be measured yet on the first decoded frame — fall back to display height
-        if (surfaceH == 0) surfaceH = getResources().getDisplayMetrics().heightPixels;
-        int surfaceW = (int) ((float) surfaceH / height * width);
-        Log.d(TAG, "Set resolution: " + width + "x" + height + " -> " + surfaceW + "x" + surfaceH);
-
-        final int w = surfaceW, h = surfaceH;
+        Log.d(TAG, "Resolution update: " + width + "x" + height);
         runOnUiThread(() -> {
-            FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(w, h);
+            // getHeight() must be called on the UI thread — View dimensions are written
+            // by the layout system on the UI thread; reading them elsewhere is a data race
+            int surfaceH = mSurface.getHeight();
+            if (surfaceH == 0) surfaceH = getResources().getDisplayMetrics().heightPixels;
+            int surfaceW = (int) ((float) surfaceH / height * width);
+            Log.d(TAG, "Set surface: " + surfaceW + "x" + surfaceH);
+
+            FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(surfaceW, surfaceH);
             params.gravity = Gravity.CENTER;
-            findViewById(R.id.video_surface).setLayoutParams(params);
+            mSurface.setLayoutParams(params);
             mConnect.setVisibility(View.GONE);
         });
     }
@@ -709,7 +710,9 @@ public class Decoder extends Activity {
                 needCreate = !decoderFailed; // createDecoder() acquires decoderLock itself
             } else {
                 try {
-                    int inputBufferId = codec.dequeueInputBuffer(0);
+                    // 5 ms timeout: gives the codec a chance to free a slot under load
+                    // instead of immediately returning -1 and silently dropping the frame
+                    int inputBufferId = codec.dequeueInputBuffer(5_000);
                     if (inputBufferId >= 0) {
                         ByteBuffer inputBuffer = codec.getInputBuffer(inputBufferId);
                         if (inputBuffer != null) {
@@ -960,9 +963,12 @@ public class Decoder extends Activity {
             // Strip userinfo from the request-line URL: credentials belong only in the
             // Authorization header — including them in the URL leaks them to server access logs.
             String path = uri.getEncodedPath();
+            String query = uri.getEncodedQuery();
+            // include query string (?param=value) — some cameras embed channel or stream IDs there
             String rtspUrl = uri.getScheme() + "://" + host
                     + (port >= 0 ? ":" + port : "")
-                    + (path != null ? path : "");
+                    + (path  != null ? path         : "")
+                    + (query != null ? "?" + query  : "");
 
             int seq = 1;
             String desc = "DESCRIBE " + rtspUrl + " RTSP/1.0\r\n" +
@@ -1195,6 +1201,10 @@ public class Decoder extends Activity {
                         SystemClock.sleep(1000);
                     }
                 } catch (Exception e) {
+                    // reset so the next iteration re-enters the connect block;
+                    // without this, an IOException thrown after activeStream=true
+                    // leaves it stuck at true and the loop spins until the watchdog fires
+                    activeStream = false;
                     Log.w(TAG, "Cannot connect rtsp: " + e.getMessage());
                     SystemClock.sleep(retryDelay);
                     retryDelay = Math.min(retryDelay * 2, 8000);
