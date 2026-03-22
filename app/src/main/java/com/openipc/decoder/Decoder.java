@@ -358,7 +358,7 @@ public class Decoder extends Activity {
 
         PopupWindow popup = new PopupWindow(layout, LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT, true);
-        popup.showAtLocation(menu, Gravity.TOP | Gravity.START, 0, dp(20));
+        popup.showAtLocation(menu, Gravity.TOP | Gravity.START, 0, 0);
 
         // camera slot selector: horizontal row [1] [2] [3] [4]
         LinearLayout camRow = new LinearLayout(this);
