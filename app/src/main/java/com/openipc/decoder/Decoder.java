@@ -122,7 +122,7 @@ public class Decoder extends Activity {
 
     // read from the network thread, written from the UI thread
     private static final int CAM_COUNT = 4;
-    private static final String DEFAULT_URL = "rtsp://root:12345@192.168.1.10:554/stream=0";
+    private static final String DEFAULT_URL = "rtsp://root:123456@192.168.1.10:554/stream=0";
     private final String[] mHosts = new String[CAM_COUNT];
     private final boolean[] mTypes = new boolean[CAM_COUNT]; // false = TCP, true = UDP
     private int mActive; // only accessed on the UI thread — no volatile needed
@@ -240,7 +240,7 @@ public class Decoder extends Activity {
 
         mActive = pref.getInt("active", 0);
         for (int i = 0; i < CAM_COUNT; i++) {
-            mHosts[i] = pref.getString("host_" + i, i == 0 ? DEFAULT_URL : "");
+            mHosts[i] = pref.getString("host_" + i, DEFAULT_URL);
             mTypes[i] = pref.getBoolean("type_" + i, false);
         }
         applyActiveCamera();
@@ -373,6 +373,11 @@ public class Decoder extends Activity {
         SpannableString s = new SpannableString(code);
         s.setSpan(new SuperscriptSpan(),    5, s.length(), 0);
         s.setSpan(new RelativeSizeSpan(0.5f), 5, s.length(), 0);
+
+        View divider = new View(this);
+        divider.setBackgroundColor(Color.DKGRAY);
+        layout.addView(divider, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 1));
 
         TextView exit = createItem("Exit");
         layout.addView(exit);
