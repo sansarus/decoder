@@ -121,6 +121,11 @@ public class Decoder extends Activity {
     private final byte[] pcmStagingBuf = new byte[PCM_BUF_SIZE];
 
     // read from the network thread, written from the UI thread
+    private static final int CAM_COUNT = 4;
+    private static final String DEFAULT_URL = "rtsp://root:12345@192.168.1.10:554/stream=0";
+    private final String[] mHosts = new String[CAM_COUNT];
+    private final boolean[] mTypes = new boolean[CAM_COUNT]; // false = TCP, true = UDP
+    private int mActive; // only accessed on the UI thread — no volatile needed
     private volatile String mHost;
     private volatile boolean mType;
     private String mVersion = "1.0";
@@ -222,15 +227,31 @@ public class Decoder extends Activity {
     @SuppressLint("AuthLeak")
     private void loadSettings() {
         SharedPreferences pref = getSharedPreferences("settings", MODE_PRIVATE);
-        mHost = pref.getString("host", "rtsp://root:12345@192.168.1.10:554/stream=0");
-        mType = pref.getBoolean("type", false); // false = TCP (default), true = UDP
+
+        // migrate legacy single-camera settings to slot 0
+        if (pref.contains("host") && !pref.contains("host_0")) {
+            SharedPreferences.Editor edit = pref.edit();
+            edit.putString("host_0", pref.getString("host", DEFAULT_URL));
+            edit.putBoolean("type_0", pref.getBoolean("type", false));
+            edit.remove("host");
+            edit.remove("type");
+            edit.apply();
+        }
+
+        mActive = pref.getInt("active", 0);
+        for (int i = 0; i < CAM_COUNT; i++) {
+            mHosts[i] = pref.getString("host_" + i, i == 0 ? DEFAULT_URL : "");
+            mTypes[i] = pref.getBoolean("type_" + i, false);
+        }
+        applyActiveCamera();
 
         Intent intent = getIntent();
         String link = intent.getStringExtra(Intent.EXTRA_TEXT);
         if (link != null) {
-            Log.d(TAG, "Link: " + Uri.parse(link).getHost()); // host only, never credentials
-            mHost = sanitizeUrl(link);
-            intent.removeExtra(Intent.EXTRA_TEXT); // consume once to avoid overriding user edits
+            Log.d(TAG, "Link: " + Uri.parse(link).getHost());
+            mHosts[mActive] = sanitizeUrl(link);
+            mHost = mHosts[mActive];
+            intent.removeExtra(Intent.EXTRA_TEXT);
         }
     }
 
@@ -239,17 +260,34 @@ public class Decoder extends Activity {
         return url.replaceAll("[\r\n]", "");
     }
 
+    /** Copy the active slot values into the volatile fields read by the network thread. */
+    private void applyActiveCamera() {
+        mHost = mHosts[mActive];
+        mType = mTypes[mActive];
+    }
+
+    /** Format the status text: "[N/4] url" or "Camera N — not configured". */
+    private String formatStatus() {
+        String url = mHosts[mActive];
+        if (url == null || url.isEmpty()) {
+            return "[" + (mActive + 1) + "/" + CAM_COUNT + "]";
+        }
+        return "[" + (mActive + 1) + "/" + CAM_COUNT + "] " + url;
+    }
+
     private void saveSettings() {
         SharedPreferences pref = getSharedPreferences("settings", MODE_PRIVATE);
         SharedPreferences.Editor edit = pref.edit();
-        edit.putString("host", mHost);
-        edit.putBoolean("type", mType);
+        edit.putInt("active", mActive);
+        for (int i = 0; i < CAM_COUNT; i++) {
+            edit.putString("host_" + i, mHosts[i]);
+            edit.putBoolean("type_" + i, mTypes[i]);
+        }
         edit.apply();
 
-        mConnect.setText(mHost);
+        applyActiveCamera();
+        mConnect.setText(formatStatus());
         activeStream = false;
-        // close the active stream sockets so the network thread unblocks immediately
-        // instead of waiting for the next packet or the UDP 1-second receive timeout
         Socket tcp = mTcpSocket;
         if (tcp != null) try { tcp.close(); } catch (Exception ignored) {}
         DatagramSocket udp = mUdpSocket;
@@ -274,11 +312,11 @@ public class Decoder extends Activity {
         TextView settings = createItem("Settings");
         layout.addView(settings);
 
-        EditText host = createEdit(mHost);
+        EditText host = createEdit(mHosts[mActive]);
         header.addView(host);
         host.setOnEditorActionListener((v, actionId, event) -> {
             if (actionId == EditorInfo.IME_ACTION_DONE) {
-                mHost = sanitizeUrl(host.getText().toString().trim());
+                mHosts[mActive] = sanitizeUrl(host.getText().toString().trim());
                 saveSettings();
                 popup.dismiss();
                 return true;
@@ -286,14 +324,43 @@ public class Decoder extends Activity {
             return false;
         });
 
-        // toggle between TCP (default) and UDP transport; persisted via saveSettings()
-        TextView typeToggle = createItem(mType ? "Transport: UDP" : "Transport: TCP");
+        TextView typeToggle = createItem(mTypes[mActive] ? "Transport: UDP" : "Transport: TCP");
         header.addView(typeToggle);
         typeToggle.setOnClickListener(v -> {
-            mType = !mType;
-            typeToggle.setText(mType ? "Transport: UDP" : "Transport: TCP");
+            mTypes[mActive] = !mTypes[mActive];
+            typeToggle.setText(mTypes[mActive] ? "Transport: UDP" : "Transport: TCP");
             saveSettings();
         });
+
+        // camera slot selector: horizontal row [1] [2] [3] [4]
+        LinearLayout camRow = new LinearLayout(this);
+        camRow.setOrientation(LinearLayout.HORIZONTAL);
+        layout.addView(camRow);
+
+        final TextView[] camButtons = new TextView[CAM_COUNT];
+        for (int i = 0; i < CAM_COUNT; i++) {
+            final int slot = i;
+            camButtons[i] = createItem(String.valueOf(i + 1));
+            camButtons[i].setGravity(Gravity.CENTER);
+            camButtons[i].setMinWidth(dp(48));
+            camRow.addView(camButtons[i]);
+
+            if (i == mActive) highlightItem(camButtons[i]);
+
+            camButtons[i].setOnClickListener(v -> {
+                if (slot == mActive) return;
+                mActive = slot;
+                for (int j = 0; j < CAM_COUNT; j++) {
+                    if (j == mActive) highlightItem(camButtons[j]);
+                    else resetItem(camButtons[j]);
+                }
+                // refresh the settings panel if it is open
+                host.setText(mHosts[mActive]);
+                host.setSelection(host.getText().length());
+                typeToggle.setText(mTypes[mActive] ? "Transport: UDP" : "Transport: TCP");
+                saveSettings();
+            });
+        }
 
         TextView webui = createItem("WebUI");
         layout.addView(webui);
@@ -305,7 +372,7 @@ public class Decoder extends Activity {
         String code = "Exit [V" + mVersion + "]";
 
         SpannableString s = new SpannableString(code);
-        s.setSpan(new SuperscriptSpan(),    5, s.length(), 0); // "[V...]" raised, excluding leading space
+        s.setSpan(new SuperscriptSpan(),    5, s.length(), 0);
         s.setSpan(new RelativeSizeSpan(0.5f), 5, s.length(), 0);
 
         TextView exit = createItem("Exit");
@@ -317,6 +384,7 @@ public class Decoder extends Activity {
             boolean show = header.getVisibility() == View.VISIBLE;
             header.setVisibility(show ? View.GONE : View.VISIBLE);
             settings.setVisibility(show ? View.VISIBLE : View.GONE);
+            camRow.setVisibility(show ? View.VISIBLE : View.GONE);
             webui.setVisibility(show ? View.VISIBLE : View.GONE);
             exit.setVisibility(show ? View.VISIBLE : View.GONE);
         });
@@ -331,6 +399,21 @@ public class Decoder extends Activity {
         focusChange(text);
 
         return text;
+    }
+
+    /** Apply blue highlight to the active camera button. */
+    private void highlightItem(TextView item) {
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(Color.BLACK);
+        bg.setStroke(2, Color.BLUE);
+        item.setBackground(bg);
+        item.setTextColor(Color.CYAN);
+    }
+
+    /** Reset camera button to default style. */
+    private void resetItem(TextView item) {
+        item.setTextColor(Color.WHITE);
+        focusChange(item);
     }
 
     private EditText createEdit(String title) {
@@ -971,7 +1054,11 @@ public class Decoder extends Activity {
 
     private void rtspConnect() throws Exception {
         nalSize = 0; // discard any partial NAL fragment from the previous session
-        Uri uri = Uri.parse(mHost);
+        String currentHost = mHost;
+        if (currentHost == null || currentHost.isEmpty()) {
+            throw new IOException("Camera slot not configured");
+        }
+        Uri uri = Uri.parse(currentHost);
         String host = uri.getHost();
         if (host == null || host.isEmpty()) {
             throw new IOException("Invalid RTSP URL: host is missing or empty");
@@ -1361,7 +1448,7 @@ public class Decoder extends Activity {
             startListener();
         }
 
-        mConnect.setText(mHost);
+        mConnect.setText(formatStatus());
         mConnect.setVisibility(View.VISIBLE);
     }
 
