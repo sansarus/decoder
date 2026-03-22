@@ -1088,9 +1088,10 @@ public class Decoder extends Activity {
                 if (mType) {
                     mUdpSocket = udpVideo;
                     mUdpAudioSocket = udpAudio;
+                    final DatagramSocket audioSock = udpAudio;
                     try {
                         Thread audioRx = new Thread(() -> {
-                            try { udpStream(udpAudio); } catch (IOException ignored) {}
+                            try { udpStream(audioSock); } catch (IOException ignored) {}
                         }, "rtsp-udp-audio");
                         audioRx.start();
                         udpStream(udpVideo);
