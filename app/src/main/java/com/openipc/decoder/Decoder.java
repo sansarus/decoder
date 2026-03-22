@@ -16,8 +16,8 @@ import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
+import android.media.AudioAttributes;
 import android.media.AudioFormat;
-import android.media.AudioManager;
 import android.media.AudioTrack;
 import android.media.MediaCodec;
 import android.media.MediaFormat;
@@ -35,6 +35,7 @@ import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.Surface;
+import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
 import android.view.Window;
@@ -75,6 +76,13 @@ public class Decoder extends Activity {
 
     private int nalSize;            // only touched on the network thread — no volatile needed
     private volatile MediaCodec mDecoder;
+    // Surface captured on the UI thread via SurfaceHolder.Callback; volatile so the
+    // network thread can safely read it in createDecoder() without holding any UI lock
+    private volatile Surface mVideoSurface;
+    // guards all MediaCodec lifecycle operations (create / use / release) so that
+    // closeDecoder() called from the network thread never races with decodeFrame()
+    // called from the video thread
+    private final Object decoderLock = new Object();
     private SurfaceView mSurface;
     private volatile AudioTrack audioTrack;
     private TextView mConnect;
@@ -150,6 +158,13 @@ public class Decoder extends Activity {
 
         mSurface = findViewById(R.id.video_surface);
         mSurface.setKeepScreenOn(true);
+        // capture the rendering Surface on the UI thread; network threads read mVideoSurface
+        // from createDecoder() — SurfaceHolder.getSurface() is not thread-safe to call directly
+        mSurface.getHolder().addCallback(new SurfaceHolder.Callback() {
+            @Override public void surfaceCreated(SurfaceHolder h)                    { mVideoSurface = h.getSurface(); }
+            @Override public void surfaceChanged(SurfaceHolder h, int f, int w, int hh) { mVideoSurface = h.getSurface(); }
+            @Override public void surfaceDestroyed(SurfaceHolder h)                  { mVideoSurface = null; }
+        });
         mConnect = findViewById(R.id.text_connect);
         mConnect.setTextColor(Color.LTGRAY);
 
@@ -614,10 +629,20 @@ public class Decoder extends Activity {
             return;
         }
 
-        // build into a local first: assigning to the volatile field immediately would expose
-        // a partially-initialised AudioTrack to onPause() → closeAudio() on the UI thread
-        AudioTrack track = new AudioTrack(AudioManager.STREAM_MUSIC, sample, format,
-                AudioFormat.ENCODING_PCM_16BIT, size, AudioTrack.MODE_STREAM);
+        // AudioTrack.Builder replaces the deprecated stream-based constructor (API 21+)
+        AudioTrack track = new AudioTrack.Builder()
+                .setAudioAttributes(new AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build())
+                .setAudioFormat(new AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(sample)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .build())
+                .setBufferSizeInBytes(size)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build();
         if (track.getState() != AudioTrack.STATE_INITIALIZED) {
             // resource exhaustion or invalid config at the OS audio layer
             Log.e(TAG, "AudioTrack failed to initialize, releasing");
@@ -657,14 +682,6 @@ public class Decoder extends Activity {
     }
 
     private void decodeFrame(Frame buffer) {
-        // snapshot to a local: onPause() can null mDecoder from the UI thread at any moment,
-        // and a volatile read between null-check and method call would be a TOCTOU race
-        MediaCodec codec = mDecoder;
-        if (codec == null) {
-            if (!decoderFailed) createDecoder(); // skip if codec proved unsupported
-            return;
-        }
-
         if (buffer.length() < 5) { // need at least 4-byte start code + 1 NAL type byte
             Log.w(TAG, "NAL frame too short: " + buffer.length());
             return;
@@ -682,49 +699,70 @@ public class Decoder extends Activity {
             flag = MediaCodec.BUFFER_FLAG_CODEC_CONFIG;
         }
 
-        try {
-            int inputBufferId = codec.dequeueInputBuffer(0);
-            if (inputBufferId >= 0) {
-                ByteBuffer inputBuffer = codec.getInputBuffer(inputBufferId);
-                if (inputBuffer != null) {
-                    inputBuffer.clear(); // reset position/limit — dequeue does not guarantee this
-                    inputBuffer.put(buffer.data(), 0, buffer.length());
-                    codec.queueInputBuffer(inputBufferId, 0,
-                            buffer.length(), System.nanoTime() / 1000, flag);
+        // Hold decoderLock for the entire codec operation: closeDecoder() (called from the
+        // network thread on codec-switch) must not call stop()/release() while we are still
+        // feeding buffers or dequeuing output — MediaCodec is not thread-safe for that.
+        boolean needCreate = false;
+        synchronized (decoderLock) {
+            MediaCodec codec = mDecoder;
+            if (codec == null) {
+                needCreate = !decoderFailed; // createDecoder() acquires decoderLock itself
+            } else {
+                try {
+                    int inputBufferId = codec.dequeueInputBuffer(0);
+                    if (inputBufferId >= 0) {
+                        ByteBuffer inputBuffer = codec.getInputBuffer(inputBufferId);
+                        if (inputBuffer != null) {
+                            inputBuffer.clear(); // reset position/limit — dequeue does not guarantee this
+                            inputBuffer.put(buffer.data(), 0, buffer.length());
+                            codec.queueInputBuffer(inputBufferId, 0,
+                                    buffer.length(), System.nanoTime() / 1000, flag);
+                        }
+                    }
+
+                    MediaCodec.BufferInfo info = mBufferInfo;
+                    int outputBufferId = codec.dequeueOutputBuffer(info, 0);
+
+                    if (outputBufferId == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                        // decoder signals a format change — read resolution from the canonical no-arg call
+                        MediaFormat format = codec.getOutputFormat();
+                        int mWidth  = format.getInteger(MediaFormat.KEY_WIDTH);
+                        int mHeight = format.getInteger(MediaFormat.KEY_HEIGHT);
+                        if (lastWidth != mWidth || lastHeight != mHeight) {
+                            lastWidth  = mWidth;
+                            lastHeight = mHeight;
+                            updateResolution(lastWidth, lastHeight);
+                        }
+                    } else if (outputBufferId >= 0) {
+                        codec.releaseOutputBuffer(outputBufferId, true);
+                    }
+                } catch (Exception e) {
+                    Log.e(TAG, "Codec exception: " + e.getMessage());
+                    // clear mDecoder under lock so the video thread won't retry before release
+                    mDecoder = null;
+                    decoderFailed = false;
+                    try { codec.stop();    } catch (Exception ignored) {}
+                    try { codec.release(); } catch (Exception ignored) {}
                 }
             }
-
-            MediaCodec.BufferInfo info = mBufferInfo;
-            int outputBufferId = codec.dequeueOutputBuffer(info, 0);
-
-            if (outputBufferId == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                // decoder signals a format change — read resolution from the canonical no-arg call
-                MediaFormat format = codec.getOutputFormat();
-                int mWidth  = format.getInteger(MediaFormat.KEY_WIDTH);
-                int mHeight = format.getInteger(MediaFormat.KEY_HEIGHT);
-                if (lastWidth != mWidth || lastHeight != mHeight) {
-                    lastWidth  = mWidth;
-                    lastHeight = mHeight;
-                    updateResolution(lastWidth, lastHeight);
-                }
-            } else if (outputBufferId >= 0) {
-                codec.releaseOutputBuffer(outputBufferId, true);
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "Codec exception: " + e.getMessage());
-            closeDecoder(); // stop() + release() to avoid native resource leak
         }
+        // createDecoder() acquires decoderLock internally — must be called outside our block
+        if (needCreate) createDecoder();
     }
 
     private void createDecoder() {
-        if (mDecoder != null) return; // already running — avoid double-init and native leak
+        // fast pre-check before allocating anything
+        synchronized (decoderLock) {
+            if (mDecoder != null) return; // already running — avoid double-init and native leak
+        }
 
-        Surface mVideo = mSurface.getHolder().getSurface();
-        if (!mVideo.isValid()) {
+        // use the Surface captured on the UI thread — getSurface() is not thread-safe to call
+        // from the network thread directly (the SurfaceHolder.Callback populates mVideoSurface)
+        Surface mVideo = mVideoSurface;
+        if (mVideo == null || !mVideo.isValid()) {
             return;
         }
 
-        MediaCodec local;
         String type = codecH265 ? "video/hevc" : "video/avc";
 
         MediaFormat format = MediaFormat.createVideoFormat(type, 1280, 720);
@@ -732,6 +770,7 @@ public class Decoder extends Activity {
         // BufferOverflowException when a large intra-frame arrives
         format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 1024 * 1024);
 
+        MediaCodec local;
         try {
             Log.i(TAG, "Start video decoder");
             local = MediaCodec.createDecoderByType(type);
@@ -751,7 +790,14 @@ public class Decoder extends Activity {
             return;
         }
 
-        mDecoder = local;
+        synchronized (decoderLock) {
+            if (mDecoder != null) {
+                // another thread created the decoder while we were outside the lock; discard ours
+                local.release();
+                return;
+            }
+            mDecoder = local;
+        }
         // reset the watchdog baseline: decodeFrame() only updates lastFrame after the codec
         // is ready, so the first call (codec==null path) returns early without touching it.
         // Without this, a keyframe interval > 3s would trigger a spurious stream disconnect.
@@ -760,18 +806,21 @@ public class Decoder extends Activity {
     }
 
     private void closeDecoder() {
-        MediaCodec codec = mDecoder;
-        if (codec != null) {
-            // null the field BEFORE stop/release: any concurrent decodeFrame() snapshot
-            // will then see null and skip, rather than operating on a stopping codec
+        MediaCodec codec;
+        synchronized (decoderLock) {
+            codec = mDecoder;
+            if (codec == null) { decoderFailed = false; return; }
+            // null first so decodeFrame() sees null as soon as possible
             mDecoder = null;
-            Log.i(TAG, "Close video decoder");
-            try {
-                codec.stop();
-                codec.release();
-            } catch (Exception e) {
-                Log.e(TAG, "Decoder close exception", e);
-            }
+        }
+        Log.i(TAG, "Close video decoder");
+        // stop()/release() outside the lock so we don't block other threads while
+        // the driver tears down the hardware codec pipeline
+        try {
+            codec.stop();
+            codec.release();
+        } catch (Exception e) {
+            Log.e(TAG, "Decoder close exception", e);
         }
         decoderFailed = false; // allow re-init on the next RTSP session
     }
@@ -831,39 +880,23 @@ public class Decoder extends Activity {
     }
 
     /**
-     * Extracts the audio clock rate from an SDP body.
-     * Looks for "a=rtpmap:<RTP_PT_PCMU> <encoding>/<clock_rate>[/<channels>]"
-     * and stores the result in {@link #audioSampleRate}.
+     * Parses the full SDP body in a single pass (RFC 4566), extracting:
+     * <ul>
+     *   <li>audio clock rate → stored in {@link #audioSampleRate}</li>
+     *   <li>video codec (H.264 vs H.265) → stored in {@link #codecH265}</li>
+     *   <li>per-track Control URLs (RFC 2326 §C.1.1) → returned as [video, audio]</li>
+     * </ul>
+     * Absolute {@code a=control:} values are used as-is; relative values are resolved
+     * against {@code baseUrl}. Falls back to "{@code baseUrl}/trackID=N" if absent.
      */
-    private void parseSdpAudioRate(String sdp) {
-        String prefix = "a=rtpmap:" + RTP_PT_PCMU + " ";
-        for (String line : sdp.split("[\r\n]+")) {
-            if (line.startsWith(prefix)) {
-                int slash = line.indexOf('/', prefix.length());
-                if (slash >= 0) {
-                    int end = line.indexOf('/', slash + 1);
-                    String rateStr = (end >= 0 ? line.substring(slash + 1, end) : line.substring(slash + 1)).trim();
-                    try {
-                        int rate = Integer.parseInt(rateStr);
-                        if (rate > 0 && rate <= 192000) {
-                            audioSampleRate = rate;
-                            Log.d(TAG, "Audio sample rate from SDP: " + rate + " Hz");
-                        }
-                    } catch (NumberFormatException ignored) {}
-                }
-                break;
-            }
-        }
-    }
+    private String[] parseSdp(String sdp, String baseUrl) {
+        String[] controls = { baseUrl + "/trackID=0", baseUrl + "/trackID=1" };
+        String audioPtPrefix = "a=rtpmap:" + RTP_PT_PCMU + " ";
+        int track = -1; // -1 = session section, 0 = video, 1 = audio
 
-    /**
-     * Detects the video codec from the SDP "m=video" line and updates {@link #codecH265}.
-     * Knowing the codec before the first RTP packet allows pre-warming the decoder immediately
-     * after PLAY, hiding the 200–500 ms MediaCodec startup cost behind network latency.
-     */
-    private void parseSdpVideoCodec(String sdp) {
         for (String line : sdp.split("[\r\n]+")) {
             if (line.startsWith("m=video")) {
+                track = 0;
                 // "m=video <port> RTP/AVP <pt> [...]" — first payload type determines codec
                 String[] parts = line.split("\\s+");
                 if (parts.length >= 4) {
@@ -874,27 +907,27 @@ public class Decoder extends Activity {
                                 + " (PT=" + pt + ")");
                     } catch (NumberFormatException ignored) {}
                 }
-                break;
-            }
-        }
-    }
-
-    /**
-     * Parses per-track Control URLs from an SDP body (RFC 2326 §C.1.1).
-     * Returns a 2-element array: [videoControlUrl, audioControlUrl].
-     * Absolute "a=control:" values are used as-is; relative values are resolved
-     * against {@code baseUrl}. Falls back to "{@code baseUrl}/trackID=N" if absent.
-     */
-    private static String[] parseSdpControls(String sdp, String baseUrl) {
-        String[] controls = { baseUrl + "/trackID=0", baseUrl + "/trackID=1" };
-        int track = -1;
-        for (String line : sdp.split("[\r\n]+")) {
-            if      (line.startsWith("m=video")) track = 0;
-            else if (line.startsWith("m=audio")) track = 1;
-            else if (line.startsWith("a=control:") && track >= 0) {
+            } else if (line.startsWith("m=audio")) {
+                track = 1;
+            } else if (line.startsWith("a=control:") && track >= 0) {
                 String ctrl = line.substring("a=control:".length()).trim();
                 // absolute URL used as-is; relative URL appended to base
                 controls[track] = ctrl.startsWith("rtsp://") ? ctrl : baseUrl + "/" + ctrl;
+            } else if (line.startsWith(audioPtPrefix)) {
+                int slash = line.indexOf('/', audioPtPrefix.length());
+                if (slash >= 0) {
+                    int end = line.indexOf('/', slash + 1);
+                    String rateStr = (end >= 0
+                            ? line.substring(slash + 1, end)
+                            : line.substring(slash + 1)).trim();
+                    try {
+                        int rate = Integer.parseInt(rateStr);
+                        if (rate > 0 && rate <= 192000) {
+                            audioSampleRate = rate;
+                            Log.d(TAG, "Audio sample rate from SDP: " + rate + " Hz");
+                        }
+                    } catch (NumberFormatException ignored) {}
+                }
             }
         }
         return controls;
@@ -954,10 +987,8 @@ public class Decoder extends Activity {
                     sdp.append(new String(skipBuf, 0, n, StandardCharsets.UTF_8));
                 sdpBodyLen -= n;
             }
-            parseSdpAudioRate(sdp.toString());
-            parseSdpVideoCodec(sdp.toString()); // detect codec early to pre-warm the decoder
-            // parse per-track Control URLs; used for SETUP requests below
-            String[] trackUrls = parseSdpControls(sdp.toString(), rtspUrl);
+            // single-pass SDP parse: audio rate, video codec, and per-track Control URLs
+            String[] trackUrls = parseSdp(sdp.toString(), rtspUrl);
 
             seq++;
             String type = mType ? "RTP/AVP/UDP;unicast;client_port=5000"
