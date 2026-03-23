@@ -38,6 +38,7 @@ import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.GestureDetector;
+import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.ScaleGestureDetector;
 import android.view.Surface;
@@ -540,27 +541,44 @@ public class Decoder extends Activity {
         intervalEdit.setPadding(dp(4), dp(6), dp(8), dp(6));
         intervalEdit.setSingleLine(true);
         intervalEdit.setImeOptions(EditorInfo.IME_ACTION_DONE);
-        focusChange(intervalEdit);
         intervalRow.addView(intervalEdit, new LinearLayout.LayoutParams(
                 0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
+        // apply interval: extracted so it can be triggered by IME, Enter key, or focus loss
+        Runnable applyInterval = () -> {
+            try {
+                int val = Integer.parseInt(intervalEdit.getText().toString().trim());
+                carouselInterval = Math.max(CAROUSEL_MIN_SEC, Math.min(CAROUSEL_MAX_SEC, val));
+            } catch (NumberFormatException ignored) {
+                carouselInterval = CAROUSEL_DEFAULT_SEC;
+            }
+            intervalEdit.setText(String.valueOf(carouselInterval));
+            saveCarouselPrefs();
+            if (carouselEnabled) {
+                carouselHandler.removeCallbacks(carouselRunnable);
+                carouselHandler.postDelayed(carouselRunnable, carouselInterval * 1000L);
+            }
+        };
+
         intervalEdit.setOnEditorActionListener((v, actionId, event) -> {
-            if (actionId == EditorInfo.IME_ACTION_DONE) {
-                try {
-                    int val = Integer.parseInt(intervalEdit.getText().toString().trim());
-                    carouselInterval = Math.max(CAROUSEL_MIN_SEC, Math.min(CAROUSEL_MAX_SEC, val));
-                } catch (NumberFormatException ignored) {
-                    carouselInterval = CAROUSEL_DEFAULT_SEC;
-                }
-                intervalEdit.setText(String.valueOf(carouselInterval));
-                saveCarouselPrefs();
-                if (carouselEnabled) {
-                    carouselHandler.removeCallbacks(carouselRunnable);
-                    carouselHandler.postDelayed(carouselRunnable, carouselInterval * 1000L);
-                }
+            if (actionId == EditorInfo.IME_ACTION_DONE
+                    || (event != null && event.getKeyCode() == KeyEvent.KEYCODE_ENTER
+                        && event.getAction() == KeyEvent.ACTION_DOWN)) {
+                applyInterval.run();
                 return true;
             }
             return false;
+        });
+
+        // border highlight + apply value on focus loss (D-pad navigation away)
+        GradientDrawable intervalBorder = new GradientDrawable();
+        intervalBorder.setColor(Color.BLACK);
+        intervalBorder.setStroke(1, Color.GRAY);
+        intervalEdit.setBackground(intervalBorder);
+        intervalEdit.setOnFocusChangeListener((v, hasFocus) -> {
+            intervalBorder.setStroke(1, hasFocus ? Color.BLUE : Color.GRAY);
+            v.setBackground(intervalBorder);
+            if (!hasFocus) applyInterval.run();
         });
 
         carouselToggle.setOnClickListener(v -> {
