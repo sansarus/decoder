@@ -191,7 +191,12 @@ public class Decoder extends Activity {
     private final Runnable carouselRunnable = new Runnable() {
         @Override public void run() {
             if (!carouselEnabled) return;
-            switchToNextCamera();
+            // skip this tick if the stream has not delivered any frames yet;
+            // let the current camera settle before switching
+            if (activeStream && lastFrame > 0
+                    && SystemClock.elapsedRealtime() - lastFrame < WATCHDOG_MS) {
+                carouselSwitch();
+            }
             carouselHandler.postDelayed(this, carouselInterval * 1000L);
         }
     };
@@ -366,6 +371,50 @@ public class Decoder extends Activity {
                 return;
             }
         }
+    }
+
+    /**
+     * Lightweight camera switch for carousel mode.
+     * Avoids full saveSettings() overhead — only updates the active slot,
+     * tears down the current stream, and lets the network thread reconnect.
+     */
+    private void carouselSwitch() {
+        int start = mActive;
+        int next = -1;
+        for (int i = 1; i <= CAM_COUNT; i++) {
+            int candidate = (start + i) % CAM_COUNT;
+            if (!mCarousel[candidate]) continue;
+            String url = mHosts[candidate];
+            if (url != null && !url.isEmpty() && !url.equals(DEFAULT_URL)) {
+                next = candidate;
+                break;
+            }
+        }
+        if (next < 0 || next == mActive) return;
+
+        mActive = next;
+        applyActiveCamera();
+
+        // tear down current stream so the network thread reconnects to the new host
+        activeStream = false;
+        Socket tcp = mTcpSocket;
+        if (tcp != null) try { tcp.close(); } catch (Exception ignored) {}
+        DatagramSocket udp = mUdpSocket;
+        if (udp != null) try { udp.close(); } catch (Exception ignored) {}
+        DatagramSocket udpAudio = mUdpAudioSocket;
+        if (udpAudio != null) try { udpAudio.close(); } catch (Exception ignored) {}
+
+        // discard stale frames from the previous camera
+        nalQueue.clear();
+        pcmQueue.clear();
+        closeDecoder();
+        closeAudio();
+
+        // reset frame timestamp so the watchdog and next carousel tick
+        // wait for actual data from the new camera
+        lastFrame = 0;
+        lastWidth = 0;
+        lastHeight = 0;
     }
 
     private void startCarousel() {
