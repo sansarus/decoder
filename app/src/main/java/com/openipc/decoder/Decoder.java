@@ -140,6 +140,7 @@ public class Decoder extends Activity {
     private static final String DEFAULT_URL = "rtsp://root:12345@192.168.1.10:554/stream=0";
     private final String[] mHosts = new String[CAM_COUNT];
     private final boolean[] mTypes = new boolean[CAM_COUNT]; // false = TCP, true = UDP
+    private final boolean[] mCarousel = new boolean[CAM_COUNT]; // per-camera carousel participation
     private int mActive; // only accessed on the UI thread — no volatile needed
     private volatile String mHost;
     private volatile boolean mType;
@@ -317,6 +318,7 @@ public class Decoder extends Activity {
         for (int i = 0; i < CAM_COUNT; i++) {
             mHosts[i] = pref.getString("host_" + i, DEFAULT_URL);
             mTypes[i] = pref.getBoolean("type_" + i, false);
+            mCarousel[i] = pref.getBoolean("carousel_" + i, false);
         }
         applyActiveCamera();
 
@@ -357,6 +359,7 @@ public class Decoder extends Activity {
         int start = mActive;
         for (int i = 1; i <= CAM_COUNT; i++) {
             int next = (start + i) % CAM_COUNT;
+            if (!mCarousel[next]) continue;
             String url = mHosts[next];
             if (url != null && !url.isEmpty() && !url.equals(DEFAULT_URL)) {
                 mActive = next;
@@ -398,6 +401,7 @@ public class Decoder extends Activity {
         for (int i = 0; i < CAM_COUNT; i++) {
             edit.putString("host_" + i, mHosts[i]);
             edit.putBoolean("type_" + i, mTypes[i]);
+            edit.putBoolean("carousel_" + i, mCarousel[i]);
         }
         edit.apply();
 
@@ -453,6 +457,16 @@ public class Decoder extends Activity {
             saveSettings();
         });
 
+        TextView carouselCamToggle = createItem(mCarousel[mActive]
+                ? "\u21BB Carousel: YES" : "\u21BB Carousel: NO");
+        header.addView(carouselCamToggle);
+        carouselCamToggle.setOnClickListener(v -> {
+            mCarousel[mActive] = !mCarousel[mActive];
+            carouselCamToggle.setText(mCarousel[mActive]
+                    ? "\u21BB Carousel: YES" : "\u21BB Carousel: NO");
+            saveSettings();
+        });
+
         final TextView[] camButtons = new TextView[CAM_COUNT];
         for (int i = 0; i < CAM_COUNT; i++) {
             final int slot = i;
@@ -475,6 +489,8 @@ public class Decoder extends Activity {
                 host.setText(mHosts[mActive]);
                 host.setSelection(host.getText().length());
                 typeToggle.setText(mTypes[mActive] ? "Transport: UDP" : "Transport: TCP");
+                carouselCamToggle.setText(mCarousel[mActive]
+                        ? "\u21BB Carousel: YES" : "\u21BB Carousel: NO");
                 saveSettings();
             });
         }
