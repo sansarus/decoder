@@ -1347,18 +1347,18 @@ public class Decoder extends Activity {
             // single-pass SDP parse: audio rate, video codec, and per-track Control URLs
             String[] trackUrls = parseSdp(sdp.toString(), rtspUrl);
 
-            // bind to ephemeral ports before SETUP to advertise in Transport header
+            // bind to fixed ports matching the OpenIPC camera convention
             DatagramSocket udpVideo = null;
             DatagramSocket udpAudio = null;
             if (mType) {
-                udpVideo = new DatagramSocket(0);
-                udpAudio = new DatagramSocket(0);
+                udpVideo = new DatagramSocket(5000);
+                udpAudio = new DatagramSocket(5002);
             }
             try {
 
             seq++;
             String type = mType
-                    ? "RTP/AVP/UDP;unicast;client_port=" + udpVideo.getLocalPort()
+                    ? "RTP/AVP/UDP;unicast;client_port=5000-5001"
                     : "RTP/AVP/TCP;unicast;interleaved=0-1";
             String video = "SETUP " + trackUrls[0] + " RTSP/1.0\r\n" +
                     "CSeq: " + seq + "\r\n" + auth + mUserAgent + "Transport: " + type + "\r\n\r\n";
@@ -1375,7 +1375,7 @@ public class Decoder extends Activity {
 
             seq++;
             type = mType
-                    ? "RTP/AVP/UDP;unicast;client_port=" + udpAudio.getLocalPort()
+                    ? "RTP/AVP/UDP;unicast;client_port=5002-5003"
                     : "RTP/AVP/TCP;unicast;interleaved=2-3";
             String audio = "SETUP " + trackUrls[1] + " RTSP/1.0\r\n" +
                     "CSeq: " + seq + "\r\n" + auth + mUserAgent + "Transport: " + type + "\r\n" +
