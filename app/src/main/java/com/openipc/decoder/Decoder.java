@@ -452,8 +452,12 @@ public class Decoder extends Activity {
         header.setVisibility(View.GONE);
         layout.addView(header);
 
+        LinearLayout.LayoutParams wrapParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+
         TextView settings = createItem("Settings");
-        layout.addView(settings);
+        layout.addView(settings, wrapParams);
 
         EditText host = createEdit(mHosts[mActive]);
         header.addView(host);
@@ -593,14 +597,14 @@ public class Decoder extends Activity {
         });
 
         TextView webui = createItem("WebUI");
-        layout.addView(webui);
+        layout.addView(webui, wrapParams);
         webui.setOnClickListener(v -> {
             startBrowser();
             popup.dismiss();
         });
 
-        layout.addView(carouselToggle);
-        layout.addView(carouselPanel);
+        layout.addView(carouselToggle, wrapParams);
+        layout.addView(carouselPanel, wrapParams);
 
         String code = "Exit [V" + mVersion + "]";
 
@@ -614,7 +618,7 @@ public class Decoder extends Activity {
                 LinearLayout.LayoutParams.MATCH_PARENT, dp(1)));
 
         TextView exit = createItem("Exit");
-        layout.addView(exit);
+        layout.addView(exit, wrapParams);
         exit.setText(s);
         exit.setOnClickListener(v -> finishAndRemoveTask());
 
