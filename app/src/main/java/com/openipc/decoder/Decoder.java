@@ -518,7 +518,7 @@ public class Decoder extends Activity {
         intervalEdit.setText(String.valueOf(carouselInterval));
         intervalEdit.setInputType(InputType.TYPE_CLASS_NUMBER);
         intervalEdit.setTextColor(Color.WHITE);
-        intervalEdit.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        intervalEdit.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
         intervalEdit.setPadding(dp(4), dp(4), dp(4), dp(4));
         intervalEdit.setSingleLine(true);
         intervalEdit.setImeOptions(EditorInfo.IME_ACTION_DONE);
@@ -600,7 +600,7 @@ public class Decoder extends Activity {
         text.setText(title);
         text.setPadding(dp(8), dp(6), dp(8), dp(6));
         text.setTextColor(Color.WHITE);
-        text.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        text.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
         focusChange(text);
 
         return text;
@@ -626,7 +626,7 @@ public class Decoder extends Activity {
         text.setText(title);
         text.setPadding(dp(8), dp(8), dp(8), dp(8));
         text.setTextColor(Color.WHITE);
-        text.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        text.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
         text.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         text.setSingleLine(true);
         text.setImeOptions(EditorInfo.IME_ACTION_DONE);
