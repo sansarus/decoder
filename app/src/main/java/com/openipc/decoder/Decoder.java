@@ -105,7 +105,6 @@ public class Decoder extends Activity {
     private static final float ZOOM_MIN = 1.0f;
     private static final float ZOOM_MAX = 5.0f;
     private volatile AudioTrack audioTrack;
-    private TextView mConnect;
 
     private volatile boolean codecH265;
     private boolean lastCodec; // only accessed on the network thread — volatile not needed
@@ -272,10 +271,7 @@ public class Decoder extends Activity {
             mGestureDetector.onTouchEvent(event);
             return true;
         });
-        mConnect = findViewById(R.id.text_connect);
-        mConnect.setVisibility(View.GONE);
-
-        codecH265 = true;
+        // codec type will be set by SDP parser; no default needed
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             WindowInsetsController ctrl = getWindow().getInsetsController();
             if (ctrl != null) {
@@ -485,7 +481,9 @@ public class Decoder extends Activity {
             mCarousel[mActive] = !mCarousel[mActive];
             carouselCamToggle.setText(mCarousel[mActive]
                     ? "Carousel: YES" : "Carousel: NO");
-            saveSettings();
+            // save only the carousel flag — no need to disconnect the active stream
+            getSharedPreferences("settings", MODE_PRIVATE).edit()
+                    .putBoolean("carousel_" + mActive, mCarousel[mActive]).apply();
         });
 
         final TextView[] camButtons = new TextView[CAM_COUNT];
@@ -1308,6 +1306,7 @@ public class Decoder extends Activity {
 
     private void rtspConnect() throws Exception {
         nalSize = 0; // discard any partial NAL fragment from the previous session
+        lastUnknownPayload = -1; // reset so warnings appear for each new session
         String currentHost = mHost;
         if (currentHost == null || currentHost.isEmpty()) {
             throw new IOException("Camera slot not configured");
@@ -1383,93 +1382,92 @@ public class Decoder extends Activity {
                 udpAudio.bind(new InetSocketAddress(5002));
             }
             try {
+                seq++;
+                String type = mType
+                        ? "RTP/AVP/UDP;unicast;client_port=5000-5001"
+                        : "RTP/AVP/TCP;unicast;interleaved=0-1";
+                String video = "SETUP " + trackUrls[0] + " RTSP/1.0\r\n" +
+                        "CSeq: " + seq + "\r\n" + auth + mUserAgent + "Transport: " + type + "\r\n\r\n";
+                w.write(video.getBytes(StandardCharsets.UTF_8));
+                w.flush();
 
-            seq++;
-            String type = mType
-                    ? "RTP/AVP/UDP;unicast;client_port=5000-5001"
-                    : "RTP/AVP/TCP;unicast;interleaved=0-1";
-            String video = "SETUP " + trackUrls[0] + " RTSP/1.0\r\n" +
-                    "CSeq: " + seq + "\r\n" + auth + mUserAgent + "Transport: " + type + "\r\n\r\n";
-            w.write(video.getBytes(StandardCharsets.UTF_8));
-            w.flush();
-
-            // read SETUP response; Session header is required to continue
-            String session = readRtspResponse(input, "Session:");
-            if (session == null) {
-                throw new IOException("RTSP server did not return a Session header");
-            }
-            // strip CR/LF to prevent the session token from injecting extra RTSP headers
-            session = session.replaceAll("[\r\n]", "");
-
-            seq++;
-            type = mType
-                    ? "RTP/AVP/UDP;unicast;client_port=5002-5003"
-                    : "RTP/AVP/TCP;unicast;interleaved=2-3";
-            String audio = "SETUP " + trackUrls[1] + " RTSP/1.0\r\n" +
-                    "CSeq: " + seq + "\r\n" + auth + mUserAgent + "Transport: " + type + "\r\n" +
-                    "Session: " + session + "\r\n\r\n";
-            w.write(audio.getBytes(StandardCharsets.UTF_8));
-            w.flush();
-
-            readRtspResponse(input, null);
-
-            seq++;
-            String play = "PLAY " + rtspUrl + " RTSP/1.0\r\n" +
-                    "CSeq: " + seq + "\r\n" + auth + mUserAgent + "Session: " + session + "\r\n\r\n";
-            w.write(play.getBytes(StandardCharsets.UTF_8));
-            w.flush();
-
-            readRtspResponse(input, null);
-
-            // disable read timeout before streaming: keyframe intervals often exceed 1 second
-            s.setSoTimeout(0);
-            // reset watchdog baseline so the 3-second timeout counts from now,
-            // not from the epoch (lastFrame == 0 would trigger the watchdog immediately)
-            lastFrame = SystemClock.elapsedRealtime();
-            activeStream = true;
-            // pre-warm the decoder now, while first packets are still in transit;
-            // without this, createDecoder() runs on the first decoded frame (~200–500 ms later)
-            createDecoder();
-            try {
-                if (mType) {
-                    mUdpSocket = udpVideo;
-                    mUdpAudioSocket = udpAudio;
-                    final DatagramSocket audioSock = udpAudio;
-                    try {
-                        // use a daemon thread so it doesn't prevent JVM exit;
-                        // socket close in onPause/closeSockets unblocks receive()
-                        Thread audioRx = new Thread(() -> {
-                            try { udpStream(audioSock); } catch (IOException ignored) {}
-                        }, "rtsp-udp-audio");
-                        audioRx.setDaemon(true);
-                        audioRx.start();
-                        udpStream(udpVideo);
-                        // ensure audio thread exits after video stream ends
-                        audioSock.close();
-                        audioRx.join(2000);
-                    } finally {
-                        mUdpSocket = null;
-                        mUdpAudioSocket = null;
-                    }
-                } else {
-                    mTcpSocket = s;
-                    try {
-                        tcpStream(input);
-                    } finally {
-                        mTcpSocket = null;
-                    }
+                // read SETUP response; Session header is required to continue
+                String session = readRtspResponse(input, "Session:");
+                if (session == null) {
+                    throw new IOException("RTSP server did not return a Session header");
                 }
-            } finally {
-                try {
-                    String teardown = "TEARDOWN " + rtspUrl + " RTSP/1.0\r\n" +
-                            "CSeq: " + (seq + 1) + "\r\n" + auth + mUserAgent +
-                            "Session: " + session + "\r\n\r\n";
-                    w.write(teardown.getBytes(StandardCharsets.UTF_8));
-                    w.flush();
-                    Log.d(TAG, "RTSP TEARDOWN sent");
-                } catch (Exception ignored) {}
-            }
+                // strip CR/LF to prevent the session token from injecting extra RTSP headers
+                session = session.replaceAll("[\r\n]", "");
 
+                seq++;
+                type = mType
+                        ? "RTP/AVP/UDP;unicast;client_port=5002-5003"
+                        : "RTP/AVP/TCP;unicast;interleaved=2-3";
+                String audio = "SETUP " + trackUrls[1] + " RTSP/1.0\r\n" +
+                        "CSeq: " + seq + "\r\n" + auth + mUserAgent + "Transport: " + type + "\r\n" +
+                        "Session: " + session + "\r\n\r\n";
+                w.write(audio.getBytes(StandardCharsets.UTF_8));
+                w.flush();
+
+                readRtspResponse(input, null);
+
+                seq++;
+                String play = "PLAY " + rtspUrl + " RTSP/1.0\r\n" +
+                        "CSeq: " + seq + "\r\n" + auth + mUserAgent + "Session: " + session + "\r\n\r\n";
+                w.write(play.getBytes(StandardCharsets.UTF_8));
+                w.flush();
+
+                readRtspResponse(input, null);
+
+                // disable read timeout before streaming: keyframe intervals often exceed 1 second
+                s.setSoTimeout(0);
+                // reset watchdog baseline so the 3-second timeout counts from now,
+                // not from the epoch (lastFrame == 0 would trigger the watchdog immediately)
+                lastFrame = SystemClock.elapsedRealtime();
+                activeStream = true;
+                // pre-warm the decoder now, while first packets are still in transit;
+                // without this, createDecoder() runs on the first decoded frame (~200–500 ms later)
+                createDecoder();
+                try {
+                    if (mType) {
+                        mUdpSocket = udpVideo;
+                        mUdpAudioSocket = udpAudio;
+                        final DatagramSocket audioSock = udpAudio;
+                        try {
+                            // daemon thread: socket close in onPause/closeSockets unblocks receive()
+                            Thread audioRx = new Thread(() -> {
+                                try { udpStream(audioSock); } catch (IOException ignored) {}
+                            }, "rtsp-udp-audio");
+                            audioRx.setDaemon(true);
+                            audioRx.start();
+                            udpStream(udpVideo);
+                            // ensure audio thread exits after video stream ends
+                            audioSock.close();
+                            try { audioRx.join(2000); } catch (InterruptedException ignored) {
+                                Thread.currentThread().interrupt();
+                            }
+                        } finally {
+                            mUdpSocket = null;
+                            mUdpAudioSocket = null;
+                        }
+                    } else {
+                        mTcpSocket = s;
+                        try {
+                            tcpStream(input);
+                        } finally {
+                            mTcpSocket = null;
+                        }
+                    }
+                } finally {
+                    try {
+                        String teardown = "TEARDOWN " + rtspUrl + " RTSP/1.0\r\n" +
+                                "CSeq: " + (seq + 1) + "\r\n" + auth + mUserAgent +
+                                "Session: " + session + "\r\n\r\n";
+                        w.write(teardown.getBytes(StandardCharsets.UTF_8));
+                        w.flush();
+                        Log.d(TAG, "RTSP TEARDOWN sent");
+                    } catch (Exception ignored) {}
+                }
             } finally {
                 if (udpVideo != null) try { udpVideo.close(); } catch (Exception ignored) {}
                 if (udpAudio != null) try { udpAudio.close(); } catch (Exception ignored) {}
