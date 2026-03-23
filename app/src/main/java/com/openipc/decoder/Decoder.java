@@ -534,22 +534,22 @@ public class Decoder extends Activity {
                 LinearLayout.LayoutParams.WRAP_CONTENT, true);
         popup.showAtLocation(menu, Gravity.TOP | Gravity.START, 0, 0);
 
-        // camera slot selector: horizontal row [1] [2] [3] [4]
+        // camRow must be WRAP_CONTENT to anchor the popup width to all 8 buttons;
+        // other menu items use default MATCH_PARENT to stretch and align uniformly
         LinearLayout camRow = new LinearLayout(this);
         camRow.setOrientation(LinearLayout.HORIZONTAL);
-        layout.addView(camRow);
+        LinearLayout.LayoutParams wrapParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        layout.addView(camRow, wrapParams);
 
         LinearLayout header = new LinearLayout(this);
         header.setOrientation(LinearLayout.VERTICAL);
         header.setVisibility(View.GONE);
         layout.addView(header);
 
-        LinearLayout.LayoutParams wrapParams = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT);
-
         TextView settings = createItem("Settings");
-        layout.addView(settings, wrapParams);
+        layout.addView(settings);
 
         EditText host = createEdit(mHosts[mActive]);
         header.addView(host);
@@ -650,7 +650,7 @@ public class Decoder extends Activity {
         intervalRow.addView(intervalEdit, new LinearLayout.LayoutParams(
                 0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
-        // apply interval: extracted so it can be triggered by IME, Enter key, or focus loss
+        // apply interval: extracted so it can be triggered by IME, Enter key, OK button, or focus loss
         Runnable applyInterval = () -> {
             try {
                 int val = Integer.parseInt(intervalEdit.getText().toString().trim());
@@ -665,6 +665,12 @@ public class Decoder extends Activity {
                 carouselHandler.postDelayed(carouselRunnable, carouselInterval * 1000L);
             }
         };
+
+        // Explicit OK button for reliable apply on Android TV / D-pad remotes
+        TextView okButton = createItem("OK");
+        okButton.setPadding(dp(12), dp(6), dp(12), dp(6));
+        intervalRow.addView(okButton);
+        okButton.setOnClickListener(v -> applyInterval.run());
 
         intervalEdit.setOnEditorActionListener((v, actionId, event) -> {
             if (actionId == EditorInfo.IME_ACTION_DONE
@@ -699,17 +705,17 @@ public class Decoder extends Activity {
         });
 
         TextView webui = createItem("WebUI");
-        layout.addView(webui, wrapParams);
+        layout.addView(webui);
         webui.setOnClickListener(v -> {
             startBrowser();
             popup.dismiss();
         });
 
-        layout.addView(carouselToggle, wrapParams);
-        layout.addView(carouselPanel, wrapParams);
+        layout.addView(carouselToggle);
+        layout.addView(carouselPanel);
 
         TextView quadToggle = createItem(quadEnabled ? "Quadrator: ON" : "Quadrator: OFF");
-        layout.addView(quadToggle, wrapParams);
+        layout.addView(quadToggle);
         quadToggle.setOnClickListener(v -> {
             popup.dismiss();
             if (quadEnabled) stopQuad(); else startQuad();
@@ -727,7 +733,7 @@ public class Decoder extends Activity {
                 LinearLayout.LayoutParams.MATCH_PARENT, dp(1)));
 
         TextView exit = createItem("Exit");
-        layout.addView(exit, wrapParams);
+        layout.addView(exit);
         exit.setText(s);
         exit.setOnClickListener(v -> finishAndRemoveTask());
 
@@ -740,6 +746,7 @@ public class Decoder extends Activity {
             carouselToggle.setVisibility(closing ? View.VISIBLE : View.GONE);
             carouselPanel.setVisibility(View.GONE);
             quadToggle.setVisibility(closing ? View.VISIBLE : View.GONE);
+            divider.setVisibility(closing ? View.VISIBLE : View.GONE);
             exit.setVisibility(closing ? View.VISIBLE : View.GONE);
             // expand to full width for the URL field; shrink back for the main menu
             popup.update(closing ? LinearLayout.LayoutParams.WRAP_CONTENT
@@ -781,11 +788,10 @@ public class Decoder extends Activity {
         text.setTextColor(Color.WHITE);
         text.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
         text.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
-        text.setSingleLine(true);
-        text.setHorizontallyScrolling(false);
-        text.setEllipsize(null);
+        // Allow visual wrapping so long URLs are fully visible
+        text.setMaxLines(3);
         text.setImeOptions(EditorInfo.IME_ACTION_DONE);
-        text.setSelection(text.getText().length());
+        text.setSelection(0);
         focusChange(text);
 
         return text;
