@@ -467,7 +467,8 @@ public class Decoder extends Activity {
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
 
-        PopupWindow popup = new PopupWindow(layout, LinearLayout.LayoutParams.MATCH_PARENT,
+        // compact width for the main menu; expanded to full screen in Settings mode
+        PopupWindow popup = new PopupWindow(layout, LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT, true);
         popup.showAtLocation(menu, Gravity.TOP | Gravity.START, 0, 0);
 
@@ -521,7 +522,8 @@ public class Decoder extends Activity {
             camButtons[i].setGravity(Gravity.CENTER);
             camButtons[i].setPadding(dp(4), dp(4), dp(4), dp(4));
             camRow.addView(camButtons[i], new LinearLayout.LayoutParams(
-                    0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT));
 
             if (i == mActive) highlightItem(camButtons[i]);
 
@@ -628,14 +630,18 @@ public class Decoder extends Activity {
         exit.setOnClickListener(v -> finishAndRemoveTask());
 
         settings.setOnClickListener(v -> {
-            boolean show = header.getVisibility() == View.VISIBLE;
-            header.setVisibility(show ? View.GONE : View.VISIBLE);
-            settings.setVisibility(show ? View.VISIBLE : View.GONE);
-            camRow.setVisibility(show ? View.VISIBLE : View.GONE);
-            webui.setVisibility(show ? View.VISIBLE : View.GONE);
-            carouselToggle.setVisibility(show ? View.VISIBLE : View.GONE);
+            boolean closing = header.getVisibility() == View.VISIBLE;
+            header.setVisibility(closing ? View.GONE : View.VISIBLE);
+            settings.setVisibility(closing ? View.VISIBLE : View.GONE);
+            camRow.setVisibility(closing ? View.VISIBLE : View.GONE);
+            webui.setVisibility(closing ? View.VISIBLE : View.GONE);
+            carouselToggle.setVisibility(closing ? View.VISIBLE : View.GONE);
             carouselPanel.setVisibility(View.GONE);
-            exit.setVisibility(show ? View.VISIBLE : View.GONE);
+            exit.setVisibility(closing ? View.VISIBLE : View.GONE);
+            // expand to full width for the URL field; shrink back for the main menu
+            popup.update(closing ? LinearLayout.LayoutParams.WRAP_CONTENT
+                    : LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT);
         });
     }
 
