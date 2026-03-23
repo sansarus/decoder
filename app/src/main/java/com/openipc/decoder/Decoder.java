@@ -508,7 +508,7 @@ public class Decoder extends Activity {
         carouselPanel.addView(intervalRow);
 
         TextView intervalLabel = createItem("Interval:");
-        intervalLabel.setPadding(dp(8), dp(4), dp(4), dp(4));
+        intervalLabel.setPadding(dp(8), dp(6), dp(4), dp(6));
         intervalRow.addView(intervalLabel);
 
         EditText intervalEdit = new EditText(this);
@@ -516,16 +516,12 @@ public class Decoder extends Activity {
         intervalEdit.setInputType(InputType.TYPE_CLASS_NUMBER);
         intervalEdit.setTextColor(Color.WHITE);
         intervalEdit.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
-        intervalEdit.setPadding(dp(4), dp(4), dp(4), dp(4));
+        intervalEdit.setPadding(dp(4), dp(6), dp(8), dp(6));
         intervalEdit.setSingleLine(true);
         intervalEdit.setImeOptions(EditorInfo.IME_ACTION_DONE);
-        intervalEdit.setMinEms(3);
         focusChange(intervalEdit);
-        intervalRow.addView(intervalEdit);
-
-        TextView secLabel = createItem("sec (" + CAROUSEL_MIN_SEC + "-" + CAROUSEL_MAX_SEC + ")");
-        secLabel.setPadding(dp(4), dp(4), dp(8), dp(4));
-        intervalRow.addView(secLabel);
+        intervalRow.addView(intervalEdit, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
         intervalEdit.setOnEditorActionListener((v, actionId, event) -> {
             if (actionId == EditorInfo.IME_ACTION_DONE) {
