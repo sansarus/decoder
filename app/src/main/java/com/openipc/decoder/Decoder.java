@@ -15,6 +15,7 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.graphics.Matrix;
 import android.graphics.drawable.GradientDrawable;
 import android.media.AudioAttributes;
 import android.media.AudioFormat;
@@ -24,6 +25,8 @@ import android.media.MediaFormat;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.SystemClock;
 import android.text.InputType;
 import android.text.SpannableString;
@@ -34,11 +37,10 @@ import android.util.DisplayMetrics;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
-import android.view.Surface;
-import android.graphics.Matrix;
 import android.view.GestureDetector;
 import android.view.MotionEvent;
 import android.view.ScaleGestureDetector;
+import android.view.Surface;
 import android.view.TextureView;
 import android.view.View;
 import android.view.Window;
@@ -66,9 +68,6 @@ import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import android.os.Handler;
-import android.os.Looper;
-
 import java.util.Locale;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
@@ -985,14 +984,13 @@ public class Decoder extends Activity {
         byte[] queued = (data == pcmStagingBuf) ? java.util.Arrays.copyOf(data, length) : data;
         Frame buffer = new Frame(queued, length);
         try {
-            // offer() with a timeout to avoid blocking the network thread when
-            // the audio consumer stalls; drop the frame if the queue stays full
-            if (!pcmQueue.offer(buffer, 200, TimeUnit.MILLISECONDS)) {
+            // non-blocking offer — drop frame immediately if queue is full
+            // to avoid stalling the network thread
+            if (!pcmQueue.offer(buffer)) {
                 Log.w(TAG, "Audio queue full, frame dropped");
             }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt(); // restore interrupt status for the caller
-            Log.w(TAG, "Audio queue interrupted");
+        } catch (Exception e) {
+            Log.w(TAG, "Audio queue error: " + e.getMessage());
         }
     }
 
@@ -1102,27 +1100,30 @@ public class Decoder extends Activity {
                         }
                     }
 
+                    // drain all available output buffers — the codec may have
+                    // multiple frames ready after a single input submission
                     MediaCodec.BufferInfo info = mBufferInfo;
-                    int outputBufferId = codec.dequeueOutputBuffer(info, 0);
-
-                    if (outputBufferId == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                        // decoder signals a format change — read resolution from the canonical no-arg call
-                        MediaFormat format = codec.getOutputFormat();
-                        int mWidth  = format.getInteger(MediaFormat.KEY_WIDTH);
-                        int mHeight = format.getInteger(MediaFormat.KEY_HEIGHT);
-                        if (lastWidth != mWidth || lastHeight != mHeight) {
-                            lastWidth  = mWidth;
-                            lastHeight = mHeight;
-                            updateResolution(lastWidth, lastHeight);
+                    int outputBufferId;
+                    while ((outputBufferId = codec.dequeueOutputBuffer(info, 0)) >= 0
+                            || outputBufferId == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                        if (outputBufferId == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                            MediaFormat format = codec.getOutputFormat();
+                            int mWidth  = format.getInteger(MediaFormat.KEY_WIDTH);
+                            int mHeight = format.getInteger(MediaFormat.KEY_HEIGHT);
+                            if (lastWidth != mWidth || lastHeight != mHeight) {
+                                lastWidth  = mWidth;
+                                lastHeight = mHeight;
+                                updateResolution(lastWidth, lastHeight);
+                            }
+                        } else {
+                            codec.releaseOutputBuffer(outputBufferId, true);
                         }
-                    } else if (outputBufferId >= 0) {
-                        codec.releaseOutputBuffer(outputBufferId, true);
                     }
                 } catch (Exception e) {
                     Log.e(TAG, "Codec exception: " + e.getMessage());
-                    // clear mDecoder under lock so the video thread won't retry before release
+                    // mark failed so the video thread won't retry until a new stream arrives
                     mDecoder = null;
-                    decoderFailed = false;
+                    decoderFailed = true;
                     try { codec.stop();    } catch (Exception ignored) {}
                     try { codec.release(); } catch (Exception ignored) {}
                 }
@@ -1575,15 +1576,9 @@ public class Decoder extends Activity {
             codecH265 = payload == RTP_PT_H265;
             Frame output = buildFrame(frame);
             if (output != null) {
-                try {
-                    // offer() with timeout mirrors the same pattern used for pcmQueue;
-                    // avoids blocking the network thread when the video decoder stalls
-                    if (!nalQueue.offer(output, 200, TimeUnit.MILLISECONDS)) {
-                        Log.w(TAG, "Video queue full, frame dropped");
-                    }
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt(); // restore interrupt status for the caller
-                    Log.w(TAG, "Video queue interrupted");
+                // non-blocking offer — drop frame if queue is full
+                if (!nalQueue.offer(output)) {
+                    Log.w(TAG, "Video queue full, frame dropped");
                 }
             }
 
@@ -1612,7 +1607,6 @@ public class Decoder extends Activity {
             while (gen == listenerGen) {
                 try {
                     if (!activeStream) {
-                        runOnUiThread(() -> {});
                         rtspConnect();
                         retryDelay = 1000; // reset backoff after any successful session
                         // brief pause before reconnecting after a clean server-side close;
@@ -1634,16 +1628,15 @@ public class Decoder extends Activity {
         executor.execute(() -> {
             Thread.currentThread().setName("rtsp-watchdog");
             while (gen == listenerGen) {
-                if (activeStream) {
-                    if (SystemClock.elapsedRealtime() - lastFrame > WATCHDOG_MS) {
-                        Log.w(TAG, "Stream is inactive");
-                        activeStream = false;
-                        // close the TCP socket so input.read() unblocks immediately —
-                        // without this, a dead camera causes the network thread to hang
-                        // until the next onPause() (UDP is already covered by setSoTimeout)
-                        Socket tcp = mTcpSocket;
-                        if (tcp != null) try { tcp.close(); } catch (Exception ignored) {}
-                    }
+                // only check when streaming and at least one frame has been received;
+                // lastFrame == 0 means a new connection is still negotiating RTSP handshake
+                if (activeStream && lastFrame > 0
+                        && SystemClock.elapsedRealtime() - lastFrame > WATCHDOG_MS) {
+                    Log.w(TAG, "Stream is inactive");
+                    activeStream = false;
+                    // close the TCP socket so input.read() unblocks immediately
+                    Socket tcp = mTcpSocket;
+                    if (tcp != null) try { tcp.close(); } catch (Exception ignored) {}
                 }
                 SystemClock.sleep(1000);
             }
