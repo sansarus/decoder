@@ -84,13 +84,17 @@ public class Decoder extends Activity {
     private int nalSize;            // only touched on the network thread — no volatile needed
     private volatile MediaCodec mDecoder;
     // Surface captured on the UI thread via TextureView.SurfaceTextureListener; volatile so the
-    // network thread can safely read it in createDecoder() without holding any UI lock
+    // network thread can safely read it in createDecoder() without holding any UI lock.
+    // Always release the previous Surface before replacing — Surface wraps a native handle.
     private volatile Surface mVideoSurface;
     // guards all MediaCodec lifecycle operations (create / use / release) so that
     // closeDecoder() called from the network thread never races with decodeFrame()
     // called from the video thread
     private final Object decoderLock = new Object();
     private TextureView mSurface;
+
+    // cached display density — avoids repeated getDisplayMetrics() calls during menu build
+    private float mDensity;
 
     // Pinch-to-zoom and pan state
     private ScaleGestureDetector mScaleDetector;
@@ -128,11 +132,6 @@ public class Decoder extends Activity {
 
     // pre-allocated to avoid per-frame GC pressure in the video decode loop
     private final MediaCodec.BufferInfo mBufferInfo = new MediaCodec.BufferInfo();
-
-    // pre-allocated audio staging buffer: PCM frames are at most a few KB;
-    // if a frame exceeds this size we fall back to a one-time heap allocation
-    private static final int PCM_BUF_SIZE = 8192;
-    private final byte[] pcmStagingBuf = new byte[PCM_BUF_SIZE];
 
     // read from the network thread, written from the UI thread
     private static final int CAM_COUNT = 8;
@@ -218,19 +217,20 @@ public class Decoder extends Activity {
             }
         } catch (PackageManager.NameNotFoundException ignored) {}
         mUserAgent = "User-Agent: OpenIPC-Decoder/" + mVersion + "\r\n";
+        mDensity = getResources().getDisplayMetrics().density;
 
         mSurface = findViewById(R.id.video_surface);
         mSurface.setKeepScreenOn(true);
         // capture the rendering Surface on the UI thread via TextureView listener
         mSurface.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
             @Override public void onSurfaceTextureAvailable(android.graphics.SurfaceTexture st, int w, int h) {
-                mVideoSurface = new Surface(st);
+                replaceSurface(new Surface(st));
             }
             @Override public void onSurfaceTextureSizeChanged(android.graphics.SurfaceTexture st, int w, int h) {
-                mVideoSurface = new Surface(st);
+                replaceSurface(new Surface(st));
             }
             @Override public boolean onSurfaceTextureDestroyed(android.graphics.SurfaceTexture st) {
-                mVideoSurface = null;
+                replaceSurface(null);
                 return true;
             }
             @Override public void onSurfaceTextureUpdated(android.graphics.SurfaceTexture st) {}
@@ -348,30 +348,6 @@ public class Decoder extends Activity {
         resetZoom();
     }
 
-    /** Format the status text: "[N/8] url" or "Camera N — not configured". */
-    private String formatStatus() {
-        String url = mHosts[mActive];
-        if (url == null || url.isEmpty()) {
-            return "[" + (mActive + 1) + "/" + CAM_COUNT + "]";
-        }
-        return "[" + (mActive + 1) + "/" + CAM_COUNT + "] " + url;
-    }
-
-    /** Advance to the next configured camera slot (carousel mode). */
-    private void switchToNextCamera() {
-        int start = mActive;
-        for (int i = 1; i <= CAM_COUNT; i++) {
-            int next = (start + i) % CAM_COUNT;
-            if (!mCarousel[next]) continue;
-            String url = mHosts[next];
-            if (url != null && !url.isEmpty() && !url.equals(DEFAULT_URL)) {
-                mActive = next;
-                saveSettings();
-                return;
-            }
-        }
-    }
-
     /**
      * Lightweight camera switch for carousel mode.
      * Avoids full saveSettings() overhead — only updates the active slot,
@@ -396,12 +372,7 @@ public class Decoder extends Activity {
 
         // tear down current stream so the network thread reconnects to the new host
         activeStream = false;
-        Socket tcp = mTcpSocket;
-        if (tcp != null) try { tcp.close(); } catch (Exception ignored) {}
-        DatagramSocket udp = mUdpSocket;
-        if (udp != null) try { udp.close(); } catch (Exception ignored) {}
-        DatagramSocket udpAudio = mUdpAudioSocket;
-        if (udpAudio != null) try { udpAudio.close(); } catch (Exception ignored) {}
+        closeSockets();
 
         // discard stale frames from the previous camera
         nalQueue.clear();
@@ -420,14 +391,12 @@ public class Decoder extends Activity {
         carouselEnabled = true;
         carouselHandler.removeCallbacks(carouselRunnable);
         carouselHandler.postDelayed(carouselRunnable, carouselInterval * 1000L);
-        mConnect.setText(formatStatus());
         saveCarouselPrefs();
     }
 
     private void stopCarousel() {
         carouselEnabled = false;
         carouselHandler.removeCallbacks(carouselRunnable);
-        mConnect.setText(formatStatus());
         saveCarouselPrefs();
     }
 
@@ -453,8 +422,12 @@ public class Decoder extends Activity {
         edit.apply();
 
         applyActiveCamera();
-        mConnect.setText(formatStatus());
         activeStream = false;
+        closeSockets();
+    }
+
+    /** Close all active network sockets to unblock I/O threads. */
+    private void closeSockets() {
         Socket tcp = mTcpSocket;
         if (tcp != null) try { tcp.close(); } catch (Exception ignored) {}
         DatagramSocket udp = mUdpSocket;
@@ -622,7 +595,7 @@ public class Decoder extends Activity {
         View divider = new View(this);
         divider.setBackgroundColor(Color.DKGRAY);
         layout.addView(divider, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 1));
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(1)));
 
         TextView exit = createItem("Exit");
         layout.addView(exit);
@@ -704,10 +677,9 @@ public class Decoder extends Activity {
         });
     }
 
-    /** Converts dp units to pixels using the current display density. */
+    /** Converts dp units to pixels using cached display density. */
     private int dp(float dp) {
-        return (int) TypedValue.applyDimension(
-                TypedValue.COMPLEX_UNIT_DIP, dp, getResources().getDisplayMetrics());
+        return (int) (dp * mDensity + 0.5f);
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -783,7 +755,6 @@ public class Decoder extends Activity {
             FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(surfaceW, surfaceH);
             params.gravity = Gravity.CENTER;
             mSurface.setLayoutParams(params);
-            mConnect.setVisibility(View.GONE);
         });
     }
 
@@ -811,6 +782,13 @@ public class Decoder extends Activity {
         mPanX = 0f;
         mPanY = 0f;
         applyZoomTransform();
+    }
+
+    /** Release the previous Surface (if any) and store the new one. */
+    private void replaceSurface(Surface next) {
+        Surface prev = mVideoSurface;
+        mVideoSurface = next;
+        if (prev != null) prev.release();
     }
 
     private int getFragment(byte data) {
@@ -973,30 +951,21 @@ public class Decoder extends Activity {
             return;
         }
 
-        // reuse pre-allocated staging buffer for typical PCM frame sizes to reduce GC pressure;
-        // fall back to heap allocation only for unusually large frames
-        byte[] data = (length <= PCM_BUF_SIZE) ? pcmStagingBuf : new byte[length];
-        System.arraycopy(frame.data(), header, data, 0, length);
+        // allocate final buffer directly — avoids staging + copyOf double-copy
+        byte[] queued = new byte[length];
+        System.arraycopy(frame.data(), header, queued, 0, length);
         // swap bytes only for big-endian encodings (L16 per RFC 3551)
         if (audioBigEndian) {
             for (int i = 0; i + 1 < length; i += 2) {
-                byte tmp = data[i];
-                data[i] = data[i + 1];
-                data[i + 1] = tmp;
+                byte tmp = queued[i];
+                queued[i] = queued[i + 1];
+                queued[i + 1] = tmp;
             }
         }
 
-        // must copy into a fresh array before queuing — pcmStagingBuf is overwritten next call
-        byte[] queued = (data == pcmStagingBuf) ? java.util.Arrays.copyOf(data, length) : data;
-        Frame buffer = new Frame(queued, length);
-        try {
-            // non-blocking offer — drop frame immediately if queue is full
-            // to avoid stalling the network thread
-            if (!pcmQueue.offer(buffer)) {
-                Log.w(TAG, "Audio queue full, frame dropped");
-            }
-        } catch (Exception e) {
-            Log.w(TAG, "Audio queue error: " + e.getMessage());
+        // non-blocking offer — drop frame immediately if queue is full
+        if (!pcmQueue.offer(new Frame(queued, length))) {
+            Log.w(TAG, "Audio queue full, frame dropped");
         }
     }
 
@@ -1401,12 +1370,17 @@ public class Decoder extends Activity {
             // single-pass SDP parse: audio rate, video codec, and per-track Control URLs
             String[] trackUrls = parseSdp(sdp.toString(), rtspUrl);
 
-            // bind to fixed ports matching the OpenIPC camera convention
+            // bind to fixed ports matching the OpenIPC camera convention;
+            // SO_REUSEADDR prevents BindException on quick restart after crash
             DatagramSocket udpVideo = null;
             DatagramSocket udpAudio = null;
             if (mType) {
-                udpVideo = new DatagramSocket(5000);
-                udpAudio = new DatagramSocket(5002);
+                udpVideo = new DatagramSocket(null);
+                udpVideo.setReuseAddress(true);
+                udpVideo.bind(new InetSocketAddress(5000));
+                udpAudio = new DatagramSocket(null);
+                udpAudio.setReuseAddress(true);
+                udpAudio.bind(new InetSocketAddress(5002));
             }
             try {
 
@@ -1462,11 +1436,17 @@ public class Decoder extends Activity {
                     mUdpAudioSocket = udpAudio;
                     final DatagramSocket audioSock = udpAudio;
                     try {
+                        // use a daemon thread so it doesn't prevent JVM exit;
+                        // socket close in onPause/closeSockets unblocks receive()
                         Thread audioRx = new Thread(() -> {
                             try { udpStream(audioSock); } catch (IOException ignored) {}
                         }, "rtsp-udp-audio");
+                        audioRx.setDaemon(true);
                         audioRx.start();
                         udpStream(udpVideo);
+                        // ensure audio thread exits after video stream ends
+                        audioSock.close();
+                        audioRx.join(2000);
                     } finally {
                         mUdpSocket = null;
                         mUdpAudioSocket = null;
@@ -1552,7 +1532,10 @@ public class Decoder extends Activity {
             }
 
             if (channel == 0 || channel == 2) {
-                processPacket(new Frame(pktBuf, len));
+                // defensive copy: pktBuf is reused on next iteration
+                byte[] copy = new byte[len];
+                System.arraycopy(pktBuf, 0, copy, 0, len);
+                processPacket(new Frame(copy, len));
             }
         }
     }
@@ -1696,21 +1679,13 @@ public class Decoder extends Activity {
             listenerGen++;  // invalidate all threads from the current generation
             listener = false;
             activeStream = false;
-            // close active sockets to immediately unblock any blocking read()/receive()
-            // on the network thread; without this, a silent camera causes a thread leak
-            Socket tcp = mTcpSocket;
-            if (tcp != null) try { tcp.close(); } catch (Exception ignored) {}
-            DatagramSocket udp = mUdpSocket;
-            if (udp != null) try { udp.close(); } catch (Exception ignored) {}
-            DatagramSocket udpAudio = mUdpAudioSocket;
-            if (udpAudio != null) try { udpAudio.close(); } catch (Exception ignored) {}
+            closeSockets();
             if (executor != null) {
                 executor.shutdownNow();
                 executor = null;
             }
             closeDecoder();
             closeAudio();
-            // discard stale frames so the new session starts with a clean slate
             nalQueue.clear();
             pcmQueue.clear();
         }
@@ -1725,8 +1700,6 @@ public class Decoder extends Activity {
             listener = true;
             startListener();
         }
-
-        mConnect.setText(formatStatus());
 
         if (carouselEnabled) {
             carouselHandler.removeCallbacks(carouselRunnable);
