@@ -645,12 +645,14 @@ public class Decoder extends Activity {
         intervalEdit.setTextColor(Color.WHITE);
         intervalEdit.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
         intervalEdit.setPadding(dp(4), dp(6), dp(8), dp(6));
-        intervalEdit.setSingleLine(true);
+        // Use setMaxLines instead of setSingleLine — setSingleLine breaks IME_ACTION_DONE
+        // on numeric keyboards (Android TV); matches the pattern from createEdit (URL field)
+        intervalEdit.setMaxLines(1);
         intervalEdit.setImeOptions(EditorInfo.IME_ACTION_DONE);
         intervalRow.addView(intervalEdit, new LinearLayout.LayoutParams(
                 0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
-        // apply interval: extracted so it can be triggered by IME, Enter key, OK button, or focus loss
+        // apply interval: triggered by IME Done, Enter key, or focus loss
         Runnable applyInterval = () -> {
             try {
                 int val = Integer.parseInt(intervalEdit.getText().toString().trim());
@@ -665,12 +667,6 @@ public class Decoder extends Activity {
                 carouselHandler.postDelayed(carouselRunnable, carouselInterval * 1000L);
             }
         };
-
-        // Explicit OK button for reliable apply on Android TV / D-pad remotes
-        TextView okButton = createItem("OK");
-        okButton.setPadding(dp(12), dp(6), dp(12), dp(6));
-        intervalRow.addView(okButton);
-        okButton.setOnClickListener(v -> applyInterval.run());
 
         intervalEdit.setOnEditorActionListener((v, actionId, event) -> {
             if (actionId == EditorInfo.IME_ACTION_DONE
@@ -788,8 +784,8 @@ public class Decoder extends Activity {
         text.setTextColor(Color.WHITE);
         text.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
         text.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
-        // Allow visual wrapping so long URLs are fully visible
-        text.setMaxLines(3);
+        // Show only the beginning of the URL (first ~20 chars), single line
+        text.setMaxLines(1);
         text.setImeOptions(EditorInfo.IME_ACTION_DONE);
         text.setSelection(0);
         focusChange(text);
