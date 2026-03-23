@@ -347,11 +347,10 @@ public class Decoder extends Activity {
     /** Format the status text: "[N/8] url" or "Camera N — not configured". */
     private String formatStatus() {
         String url = mHosts[mActive];
-        String prefix = carouselEnabled ? "\u21BB " : "";
         if (url == null || url.isEmpty()) {
-            return prefix + "[" + (mActive + 1) + "/" + CAM_COUNT + "]";
+            return "[" + (mActive + 1) + "/" + CAM_COUNT + "]";
         }
-        return prefix + "[" + (mActive + 1) + "/" + CAM_COUNT + "] " + url;
+        return "[" + (mActive + 1) + "/" + CAM_COUNT + "] " + url;
     }
 
     /** Advance to the next configured camera slot (carousel mode). */
@@ -458,12 +457,12 @@ public class Decoder extends Activity {
         });
 
         TextView carouselCamToggle = createItem(mCarousel[mActive]
-                ? "\u21BB Carousel: YES" : "\u21BB Carousel: NO");
+                ? "Carousel: YES" : "Carousel: NO");
         header.addView(carouselCamToggle);
         carouselCamToggle.setOnClickListener(v -> {
             mCarousel[mActive] = !mCarousel[mActive];
             carouselCamToggle.setText(mCarousel[mActive]
-                    ? "\u21BB Carousel: YES" : "\u21BB Carousel: NO");
+                    ? "Carousel: YES" : "Carousel: NO");
             saveSettings();
         });
 
@@ -490,7 +489,7 @@ public class Decoder extends Activity {
                 host.setSelection(host.getText().length());
                 typeToggle.setText(mTypes[mActive] ? "Transport: UDP" : "Transport: TCP");
                 carouselCamToggle.setText(mCarousel[mActive]
-                        ? "\u21BB Carousel: YES" : "\u21BB Carousel: NO");
+                        ? "Carousel: YES" : "Carousel: NO");
                 saveSettings();
             });
         }
@@ -501,7 +500,7 @@ public class Decoder extends Activity {
         carouselPanel.setVisibility(View.GONE);
 
         TextView carouselToggle = createItem(carouselEnabled
-                ? "\u21BB Carousel: ON" : "\u21BB Carousel: OFF");
+                ? "Carousel: ON" : "Carousel: OFF");
 
         LinearLayout intervalRow = new LinearLayout(this);
         intervalRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -554,7 +553,7 @@ public class Decoder extends Activity {
                 if (carouselEnabled) stopCarousel();
                 else startCarousel();
                 carouselToggle.setText(carouselEnabled
-                        ? "\u21BB Carousel: ON" : "\u21BB Carousel: OFF");
+                        ? "Carousel: ON" : "Carousel: OFF");
             }
         });
 
