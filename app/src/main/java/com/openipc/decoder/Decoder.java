@@ -182,7 +182,7 @@ public class Decoder extends Activity {
     // carousel auto-switch state — all accessed on the UI thread only
     private static final int CAROUSEL_MIN_SEC = 3;
     private static final int CAROUSEL_MAX_SEC = 120;
-    private static final int CAROUSEL_DEFAULT_SEC = 5;
+    private static final int CAROUSEL_DEFAULT_SEC = 10;
     private boolean carouselEnabled;
     private int carouselInterval = CAROUSEL_DEFAULT_SEC;
     private final Handler carouselHandler = new Handler(Looper.getMainLooper());
