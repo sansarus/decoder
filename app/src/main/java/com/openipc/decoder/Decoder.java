@@ -66,6 +66,9 @@ import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import android.os.Handler;
+import android.os.Looper;
+
 import java.util.Locale;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
@@ -176,6 +179,21 @@ public class Decoder extends Activity {
 
     // reference kept so we can dismiss the dialog (and destroy the WebView) on rotation
     private Dialog mBrowserDialog; // only accessed on the UI thread — no volatile needed
+
+    // carousel auto-switch state — all accessed on the UI thread only
+    private static final int CAROUSEL_MIN_SEC = 3;
+    private static final int CAROUSEL_MAX_SEC = 120;
+    private static final int CAROUSEL_DEFAULT_SEC = 10;
+    private boolean carouselEnabled;
+    private int carouselInterval = CAROUSEL_DEFAULT_SEC;
+    private final Handler carouselHandler = new Handler(Looper.getMainLooper());
+    private final Runnable carouselRunnable = new Runnable() {
+        @Override public void run() {
+            if (!carouselEnabled) return;
+            switchToNextCamera();
+            carouselHandler.postDelayed(this, carouselInterval * 1000L);
+        }
+    };
 
     private ExecutorService executor; // only accessed on the UI thread — no volatile needed
 
@@ -294,6 +312,8 @@ public class Decoder extends Activity {
         }
 
         mActive = pref.getInt("active", 0);
+        carouselEnabled = pref.getBoolean("carousel_enabled", false);
+        carouselInterval = pref.getInt("carousel_interval", CAROUSEL_DEFAULT_SEC);
         for (int i = 0; i < CAM_COUNT; i++) {
             mHosts[i] = pref.getString("host_" + i, DEFAULT_URL);
             mTypes[i] = pref.getBoolean("type_" + i, false);
@@ -325,16 +345,56 @@ public class Decoder extends Activity {
     /** Format the status text: "[N/8] url" or "Camera N — not configured". */
     private String formatStatus() {
         String url = mHosts[mActive];
+        String prefix = carouselEnabled ? "\u21BB " : "";
         if (url == null || url.isEmpty()) {
-            return "[" + (mActive + 1) + "/" + CAM_COUNT + "]";
+            return prefix + "[" + (mActive + 1) + "/" + CAM_COUNT + "]";
         }
-        return "[" + (mActive + 1) + "/" + CAM_COUNT + "] " + url;
+        return prefix + "[" + (mActive + 1) + "/" + CAM_COUNT + "] " + url;
+    }
+
+    /** Advance to the next configured camera slot (carousel mode). */
+    private void switchToNextCamera() {
+        int start = mActive;
+        for (int i = 1; i <= CAM_COUNT; i++) {
+            int next = (start + i) % CAM_COUNT;
+            String url = mHosts[next];
+            if (url != null && !url.isEmpty() && !url.equals(DEFAULT_URL)) {
+                mActive = next;
+                saveSettings();
+                return;
+            }
+        }
+    }
+
+    private void startCarousel() {
+        carouselEnabled = true;
+        carouselHandler.removeCallbacks(carouselRunnable);
+        carouselHandler.postDelayed(carouselRunnable, carouselInterval * 1000L);
+        mConnect.setText(formatStatus());
+        saveCarouselPrefs();
+    }
+
+    private void stopCarousel() {
+        carouselEnabled = false;
+        carouselHandler.removeCallbacks(carouselRunnable);
+        mConnect.setText(formatStatus());
+        saveCarouselPrefs();
+    }
+
+    private void saveCarouselPrefs() {
+        SharedPreferences pref = getSharedPreferences("settings", MODE_PRIVATE);
+        pref.edit()
+            .putBoolean("carousel_enabled", carouselEnabled)
+            .putInt("carousel_interval", carouselInterval)
+            .apply();
     }
 
     private void saveSettings() {
         SharedPreferences pref = getSharedPreferences("settings", MODE_PRIVATE);
         SharedPreferences.Editor edit = pref.edit();
         edit.putInt("active", mActive);
+        edit.putBoolean("carousel_enabled", carouselEnabled);
+        edit.putInt("carousel_interval", carouselInterval);
         for (int i = 0; i < CAM_COUNT; i++) {
             edit.putString("host_" + i, mHosts[i]);
             edit.putBoolean("type_" + i, mTypes[i]);
@@ -406,6 +466,7 @@ public class Decoder extends Activity {
 
             camButtons[i].setOnClickListener(v -> {
                 if (slot == mActive) return;
+                if (carouselEnabled) stopCarousel();
                 mActive = slot;
                 for (int j = 0; j < CAM_COUNT; j++) {
                     if (j == mActive) highlightItem(camButtons[j]);
@@ -417,6 +478,71 @@ public class Decoder extends Activity {
                 saveSettings();
             });
         }
+
+        // carousel controls
+        LinearLayout carouselPanel = new LinearLayout(this);
+        carouselPanel.setOrientation(LinearLayout.VERTICAL);
+        carouselPanel.setVisibility(View.GONE);
+        layout.addView(carouselPanel);
+
+        TextView carouselToggle = createItem(carouselEnabled
+                ? "\u21BB Carousel: ON" : "\u21BB Carousel: OFF");
+        layout.addView(carouselToggle);
+
+        LinearLayout intervalRow = new LinearLayout(this);
+        intervalRow.setOrientation(LinearLayout.HORIZONTAL);
+        intervalRow.setGravity(Gravity.CENTER_VERTICAL);
+        carouselPanel.addView(intervalRow);
+
+        TextView intervalLabel = createItem("Interval:");
+        intervalLabel.setPadding(dp(8), dp(4), dp(4), dp(4));
+        intervalRow.addView(intervalLabel);
+
+        EditText intervalEdit = new EditText(this);
+        intervalEdit.setText(String.valueOf(carouselInterval));
+        intervalEdit.setInputType(InputType.TYPE_CLASS_NUMBER);
+        intervalEdit.setTextColor(Color.WHITE);
+        intervalEdit.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        intervalEdit.setPadding(dp(4), dp(4), dp(4), dp(4));
+        intervalEdit.setSingleLine(true);
+        intervalEdit.setImeOptions(EditorInfo.IME_ACTION_DONE);
+        intervalEdit.setMinEms(3);
+        focusChange(intervalEdit);
+        intervalRow.addView(intervalEdit);
+
+        TextView secLabel = createItem("sec (" + CAROUSEL_MIN_SEC + "-" + CAROUSEL_MAX_SEC + ")");
+        secLabel.setPadding(dp(4), dp(4), dp(8), dp(4));
+        intervalRow.addView(secLabel);
+
+        intervalEdit.setOnEditorActionListener((v, actionId, event) -> {
+            if (actionId == EditorInfo.IME_ACTION_DONE) {
+                try {
+                    int val = Integer.parseInt(intervalEdit.getText().toString().trim());
+                    carouselInterval = Math.max(CAROUSEL_MIN_SEC, Math.min(CAROUSEL_MAX_SEC, val));
+                } catch (NumberFormatException ignored) {
+                    carouselInterval = CAROUSEL_DEFAULT_SEC;
+                }
+                intervalEdit.setText(String.valueOf(carouselInterval));
+                saveCarouselPrefs();
+                if (carouselEnabled) {
+                    carouselHandler.removeCallbacks(carouselRunnable);
+                    carouselHandler.postDelayed(carouselRunnable, carouselInterval * 1000L);
+                }
+                return true;
+            }
+            return false;
+        });
+
+        carouselToggle.setOnClickListener(v -> {
+            boolean show = carouselPanel.getVisibility() != View.VISIBLE;
+            carouselPanel.setVisibility(show ? View.VISIBLE : View.GONE);
+            if (!show) {
+                if (carouselEnabled) stopCarousel();
+                else startCarousel();
+                carouselToggle.setText(carouselEnabled
+                        ? "\u21BB Carousel: ON" : "\u21BB Carousel: OFF");
+            }
+        });
 
         TextView webui = createItem("WebUI");
         layout.addView(webui);
@@ -446,6 +572,8 @@ public class Decoder extends Activity {
             header.setVisibility(show ? View.GONE : View.VISIBLE);
             settings.setVisibility(show ? View.VISIBLE : View.GONE);
             camRow.setVisibility(show ? View.VISIBLE : View.GONE);
+            carouselToggle.setVisibility(show ? View.VISIBLE : View.GONE);
+            carouselPanel.setVisibility(View.GONE);
             webui.setVisibility(show ? View.VISIBLE : View.GONE);
             exit.setVisibility(show ? View.VISIBLE : View.GONE);
         });
@@ -1496,6 +1624,7 @@ public class Decoder extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
+        carouselHandler.removeCallbacks(carouselRunnable);
         // dismiss any open browser dialog; its OnDismissListener will call view.destroy()
         // preventing a WebView native-resource leak when the Activity is rotated
         Dialog browser = mBrowserDialog;
@@ -1537,6 +1666,11 @@ public class Decoder extends Activity {
 
         mConnect.setText(formatStatus());
         mConnect.setVisibility(View.VISIBLE);
+
+        if (carouselEnabled) {
+            carouselHandler.removeCallbacks(carouselRunnable);
+            carouselHandler.postDelayed(carouselRunnable, carouselInterval * 1000L);
+        }
     }
 
     private record Frame(byte[] data, int length) {
