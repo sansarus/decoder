@@ -269,7 +269,7 @@ public class Decoder extends Activity {
             return true;
         });
         mConnect = findViewById(R.id.text_connect);
-        mConnect.setTextColor(Color.LTGRAY);
+        mConnect.setVisibility(View.GONE);
 
         codecH265 = true;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -1565,7 +1565,7 @@ public class Decoder extends Activity {
             while (gen == listenerGen) {
                 try {
                     if (!activeStream) {
-                        runOnUiThread(() -> mConnect.setVisibility(View.VISIBLE));
+                        runOnUiThread(() -> {});
                         rtspConnect();
                         retryDelay = 1000; // reset backoff after any successful session
                         // brief pause before reconnecting after a clean server-side close;
@@ -1681,7 +1681,6 @@ public class Decoder extends Activity {
         }
 
         mConnect.setText(formatStatus());
-        mConnect.setVisibility(View.VISIBLE);
 
         if (carouselEnabled) {
             carouselHandler.removeCallbacks(carouselRunnable);
