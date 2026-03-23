@@ -499,11 +499,9 @@ public class Decoder extends Activity {
         LinearLayout carouselPanel = new LinearLayout(this);
         carouselPanel.setOrientation(LinearLayout.VERTICAL);
         carouselPanel.setVisibility(View.GONE);
-        layout.addView(carouselPanel);
 
         TextView carouselToggle = createItem(carouselEnabled
                 ? "\u21BB Carousel: ON" : "\u21BB Carousel: OFF");
-        layout.addView(carouselToggle);
 
         LinearLayout intervalRow = new LinearLayout(this);
         intervalRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -567,6 +565,9 @@ public class Decoder extends Activity {
             popup.dismiss();
         });
 
+        layout.addView(carouselToggle);
+        layout.addView(carouselPanel);
+
         String code = "Exit [V" + mVersion + "]";
 
         SpannableString s = new SpannableString(code);
@@ -588,9 +589,9 @@ public class Decoder extends Activity {
             header.setVisibility(show ? View.GONE : View.VISIBLE);
             settings.setVisibility(show ? View.VISIBLE : View.GONE);
             camRow.setVisibility(show ? View.VISIBLE : View.GONE);
+            webui.setVisibility(show ? View.VISIBLE : View.GONE);
             carouselToggle.setVisibility(show ? View.VISIBLE : View.GONE);
             carouselPanel.setVisibility(View.GONE);
-            webui.setVisibility(show ? View.VISIBLE : View.GONE);
             exit.setVisibility(show ? View.VISIBLE : View.GONE);
         });
     }
