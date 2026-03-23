@@ -419,7 +419,7 @@ public class Decoder extends Activity {
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
 
-        PopupWindow popup = new PopupWindow(layout, LinearLayout.LayoutParams.WRAP_CONTENT,
+        PopupWindow popup = new PopupWindow(layout, LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT, true);
         popup.showAtLocation(menu, Gravity.TOP | Gravity.START, 0, 0);
 
@@ -625,6 +625,8 @@ public class Decoder extends Activity {
         text.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
         text.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         text.setSingleLine(true);
+        text.setHorizontallyScrolling(false);
+        text.setEllipsize(null);
         text.setImeOptions(EditorInfo.IME_ACTION_DONE);
         text.setSelection(text.getText().length());
         focusChange(text);
