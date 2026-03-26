@@ -2350,17 +2350,17 @@ public class Decoder extends Activity {
 
     private record Frame(byte[] data, int length) {
     }
-     @Override
-+    public boolean onKeyDown(int keyCode, KeyEvent event) {
-+        Log.d(TAG, "Key pressed: " + keyCode);
-+        
-+        switch (keyCode) {
-+            case KeyEvent.KEYCODE_DPAD_CENTER:
-+            case KeyEvent.KEYCODE_ENTER:
-+                createMenu(findViewById(R.id.decoder));
-+                return true;
-+            default:
-+                return super.onKeyDown(keyCode, event);
-+        }
-+    }
+    # @Override
+    public boolean onKeyDown(int keyCode, KeyEvent event) {
+        Log.d(TAG, "Key pressed: " + keyCode);
+        
+        switch (keyCode) {
+            case KeyEvent.KEYCODE_DPAD_CENTER:
+            case KeyEvent.KEYCODE_ENTER:
+                createMenu(findViewById(R.id.decoder));
+                return true;
+            default:
+                return super.onKeyDown(keyCode, event);
+        }
+    }
 }
