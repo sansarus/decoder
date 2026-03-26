@@ -87,6 +87,7 @@ public class Decoder extends Activity {
     //add web server control
     private WebServer webServer;   
     private Thread webServerThread;
+    private TextView mConnect; 
     //
     
     private volatile MediaCodec mDecoder;
@@ -232,6 +233,12 @@ public class Decoder extends Activity {
         if (url != null) {
             Log.d(TAG, "Camera " + i + ": " + url);
         }
+    }
+
+
+         mConnect = findViewById(R.id.text_connect);
+    if (mConnect != null) {
+        mConnect.setTextColor(Color.LTGRAY);
     }
         //
 
@@ -1906,6 +1913,9 @@ private void saveSettings() {
         super.onResume();
 
         loadSettings();
+        if (webServer == null) {
+        startWebServer();
+        }
         if (quadEnabled) {
             // re-enter quad mode after pause/resume
             mSurface.setVisibility(View.GONE);
@@ -2436,7 +2446,7 @@ private void saveSettings() {
     }
 
     //web server adds
-  private void startWebServer() {
+private void startWebServer() {
     if (webServer == null) {
         webServer = new WebServer(getSharedPreferences("settings", MODE_PRIVATE));
         webServer.setListener(this); // Устанавливаем слушатель
@@ -2451,23 +2461,28 @@ private void saveSettings() {
 private void showWebServerAddress() {
     try {
         java.net.NetworkInterface networkInterface = java.net.NetworkInterface.getByName("wlan0");
-        java.util.Enumeration<java.net.InetAddress> addresses = networkInterface.getInetAddresses();
-        while (addresses.hasMoreElements()) {
-            java.net.InetAddress addr = addresses.nextElement();
-            if (!addr.isLoopbackAddress() && addr.getAddress().length == 4) {
-                String ip = addr.getHostAddress();
-                Log.i(TAG, "========================================");
-                Log.i(TAG, "Web Interface available at:");
-                Log.i(TAG, "http://" + ip + ":8080");
-                Log.i(TAG, "========================================");
-                
-                // Показываем Toast с адресом
-                runOnUiThread(() -> {
-                    android.widget.Toast.makeText(this, 
-                        "🌐 WebUI: http://" + ip + ":8080", 
-                        android.widget.Toast.LENGTH_LONG).show();
-                });
-                break;
+        if (networkInterface == null) {
+            networkInterface = java.net.NetworkInterface.getByName("eth0");
+        }
+        if (networkInterface != null) {
+            java.util.Enumeration<java.net.InetAddress> addresses = networkInterface.getInetAddresses();
+            while (addresses.hasMoreElements()) {
+                java.net.InetAddress addr = addresses.nextElement();
+                if (!addr.isLoopbackAddress() && addr.getAddress().length == 4) {
+                    String ip = addr.getHostAddress();
+                    Log.i(TAG, "========================================");
+                    Log.i(TAG, "Web Interface available at:");
+                    Log.i(TAG, "http://" + ip + ":8080");
+                    Log.i(TAG, "========================================");
+                    
+                    // Показываем Toast с адресом
+                    runOnUiThread(() -> {
+                        android.widget.Toast.makeText(this, 
+                            "🌐 WebUI: http://" + ip + ":8080", 
+                            android.widget.Toast.LENGTH_LONG).show();
+                    });
+                    break;
+                }
             }
         }
     } catch (Exception e) {
@@ -2482,7 +2497,7 @@ public void onSettingsChanged() {
         // Перезагружаем настройки
         loadSettings();
         
-        // Перезапускаем стрим если он активен
+        // Перезапускаем стрим если он активен и не в quad режиме
         if (listener && !quadEnabled) {
             activeStream = false;
             closeSockets();
@@ -2490,20 +2505,17 @@ public void onSettingsChanged() {
             closeAudio();
             nalQueue.clear();
             pcmQueue.clear();
-            
-            // Перезапускаем подключение
-            activeStream = false;
         }
         
         // Обновляем UI если нужно
-        if (!quadEnabled) {
-            // Обновляем текст подключения
+        if (!quadEnabled && mConnect != null) {
             mConnect.setText(mHost);
+            mConnect.setVisibility(View.VISIBLE);
         }
         
         // Показываем уведомление
         android.widget.Toast.makeText(this, 
-            "Settings updated from WebUI", 
+            "Settings updated from WebUI.\nRestarting stream...", 
             android.widget.Toast.LENGTH_SHORT).show();
     });
 }
