@@ -19,9 +19,18 @@ public class WebServer extends Thread {
     private SharedPreferences prefs;
     private int port = 8080;
     private static final int CAM_COUNT = 8;
+    private SettingsChangeListener listener;
+
+    public interface SettingsChangeListener {
+        void onSettingsChanged();
+    }
 
     public WebServer(SharedPreferences prefs) {
         this.prefs = prefs;
+    }
+    
+    public void setListener(SettingsChangeListener listener) {
+        this.listener = listener;
     }
 
     @Override
@@ -75,27 +84,58 @@ public class WebServer extends Thread {
             reader.read(buffer, 0, contentLength);
             String data = new String(buffer);
             
+            Log.d(TAG, "Received POST data: " + data);
+            
             // Парсим параметры
             String[] params = data.split("&");
+            SharedPreferences.Editor editor = prefs.edit();
+            boolean settingsChanged = false;
+            
             for (String param : params) {
                 String[] kv = param.split("=", 2);
                 if (kv.length == 2) {
                     String key = kv[0];
                     String value = decodeUrl(kv[1]);
                     
+                    Log.d(TAG, "Processing: " + key + " = " + value);
+                    
                     if (key.startsWith("cam_")) {
                         int camId = Integer.parseInt(key.substring(4));
-                        SharedPreferences.Editor editor = prefs.edit();
                         editor.putString("host_" + camId, value);
-                        editor.apply();
+                        settingsChanged = true;
                         Log.i(TAG, "Updated camera " + camId + " URL: " + value);
+                    } else if (key.startsWith("type_")) {
+                        int camId = Integer.parseInt(key.substring(5));
+                        editor.putBoolean("type_" + camId, Boolean.parseBoolean(value));
+                        settingsChanged = true;
+                    } else if (key.startsWith("carousel_") && !key.equals("carousel_enabled") && !key.equals("carousel_interval")) {
+                        int camId = Integer.parseInt(key.substring(9));
+                        editor.putBoolean("carousel_" + camId, Boolean.parseBoolean(value));
+                        settingsChanged = true;
+                    } else if (key.startsWith("quad_")) {
+                        int camId = Integer.parseInt(key.substring(5));
+                        editor.putBoolean("quad_" + camId, Boolean.parseBoolean(value));
+                        settingsChanged = true;
                     } else if (key.equals("active")) {
-                        prefs.edit().putInt("active", Integer.parseInt(value)).apply();
+                        editor.putInt("active", Integer.parseInt(value));
+                        settingsChanged = true;
                     } else if (key.equals("carousel_enabled")) {
-                        prefs.edit().putBoolean("carousel_enabled", Boolean.parseBoolean(value)).apply();
+                        editor.putBoolean("carousel_enabled", Boolean.parseBoolean(value));
+                        settingsChanged = true;
                     } else if (key.equals("carousel_interval")) {
-                        prefs.edit().putInt("carousel_interval", Integer.parseInt(value)).apply();
+                        editor.putInt("carousel_interval", Integer.parseInt(value));
+                        settingsChanged = true;
                     }
+                }
+            }
+            
+            if (settingsChanged) {
+                editor.apply();
+                Log.i(TAG, "Settings saved successfully");
+                
+                // Уведомляем активность об изменении настроек
+                if (listener != null) {
+                    listener.onSettingsChanged();
                 }
             }
             
@@ -360,6 +400,7 @@ public class WebServer extends Thread {
                "                document.getElementById('carouselInterval').value = config.carousel_interval;\n" +
                "                renderCameras();\n" +
                "            } catch (error) {\n" +
+               "                console.error('Failed to load config:', error);\n" +
                "                showStatus('Failed to load configuration', 'error');\n" +
                "            }\n" +
                "        }\n" +
@@ -410,11 +451,13 @@ public class WebServer extends Thread {
                "                \n" +
                "                if (response.ok) {\n" +
                "                    showStatus(`Camera ${camId + 1} saved successfully!`, 'success');\n" +
+               "                    setTimeout(() => loadConfig(), 1000);\n" +
                "                } else {\n" +
                "                    showStatus('Failed to save camera settings', 'error');\n" +
                "                }\n" +
                "            } catch (error) {\n" +
-               "                showStatus('Network error', 'error');\n" +
+               "                console.error('Save error:', error);\n" +
+               "                showStatus('Network error: ' + error.message, 'error');\n" +
                "            }\n" +
                "        }\n" +
                "        \n" +
@@ -448,11 +491,13 @@ public class WebServer extends Thread {
                "                \n" +
                "                if (response.ok) {\n" +
                "                    showStatus('All settings saved successfully!', 'success');\n" +
+               "                    setTimeout(() => loadConfig(), 1000);\n" +
                "                } else {\n" +
                "                    showStatus('Failed to save settings', 'error');\n" +
                "                }\n" +
                "            } catch (error) {\n" +
-               "                showStatus('Network error', 'error');\n" +
+               "                console.error('Save all error:', error);\n" +
+               "                showStatus('Network error: ' + error.message, 'error');\n" +
                "            }\n" +
                "        }\n" +
                "        \n" +
@@ -467,16 +512,16 @@ public class WebServer extends Thread {
                "        }\n" +
                "        \n" +
                "        function escapeHtml(text) {\n" +
-               "            return text.replace(/[&<>]/g, function(m) {\n" +
-               "                if (m === '&') return '&amp;';\n" +
-               "                if (m === '<') return '&lt;';\n" +
-               "                if (m === '>') return '&gt;';\n" +
-               "                return m;\n" +
-               "            }).replace(/\"/g, '&quot;');\n" +
+               "            const div = document.createElement('div');\n" +
+               "            div.textContent = text;\n" +
+               "            return div.innerHTML;\n" +
                "        }\n" +
                "        \n" +
                "        document.getElementById('saveGlobal').addEventListener('click', saveAll);\n" +
                "        loadConfig();\n" +
+               "        \n" +
+               "        // Auto-refresh every 5 seconds\n" +
+               "        setInterval(loadConfig, 5000);\n" +
                "    </script>\n" +
                "</body>\n" +
                "</html>";
