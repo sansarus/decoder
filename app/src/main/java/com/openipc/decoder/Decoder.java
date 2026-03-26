@@ -76,35 +76,25 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
-public class Decoder extends Activity {
+public class Decoder extends Activity implements WebServer.SettingsChangeListener {
     private static final String TAG = "OpenIPCDecoder";
     private final BlockingQueue<Frame> nalQueue = new ArrayBlockingQueue<>(32);
     private final BlockingQueue<Frame> pcmQueue = new ArrayBlockingQueue<>(32);
     private final byte[] nalBuffer = new byte[1024 * 1024];
 
-    private int nalSize;            // only touched on the network thread — no volatile needed
+    private int nalSize;
 
-    //add web server control
-    private WebServer webServer;   
+    // web server control
+    private WebServer webServer;
     private Thread webServerThread;
-    private TextView mConnect; 
-    //
-    
+
     private volatile MediaCodec mDecoder;
-    // Surface captured on the UI thread via TextureView.SurfaceTextureListener; volatile so the
-    // network thread can safely read it in createDecoder() without holding any UI lock.
-    // Always release the previous Surface before replacing — Surface wraps a native handle.
     private volatile Surface mVideoSurface;
-    // guards all MediaCodec lifecycle operations (create / use / release) so that
-    // closeDecoder() called from the network thread never races with decodeFrame()
-    // called from the video thread
     private final Object decoderLock = new Object();
     private TextureView mSurface;
 
-    // cached display density — avoids repeated getDisplayMetrics() calls during menu build
     private float mDensity;
 
-    // Pinch-to-zoom and pan state
     private ScaleGestureDetector mScaleDetector;
     private GestureDetector mGestureDetector;
     private float mZoomScale = 1.0f;
@@ -115,79 +105,57 @@ public class Decoder extends Activity {
     private volatile AudioTrack audioTrack;
 
     private volatile boolean codecH265;
-    private boolean lastCodec; // only accessed on the network thread — volatile not needed
-    private boolean listener;       // only accessed on the UI thread — no volatile needed
+    private boolean lastCodec;
+    private boolean listener;
     private volatile boolean activeStream;
     private volatile int lastWidth;
     private volatile int lastHeight;
     private volatile long lastFrame;
 
-    // incremented in onPause so that orphaned threads from the previous
-    // lifecycle can detect they are stale and exit their loops
     private volatile int listenerGen;
-
-    // set on audio init failure; cleared on session close to allow next retry
     private volatile boolean audioFailed;
-
-    // set on codec init failure; prevents per-frame retry when codec is unsupported
     private volatile boolean decoderFailed;
 
-    // held so onPause() can close them to unblock blocking read()/receive() on the network thread
     private volatile Socket mTcpSocket;
     private volatile DatagramSocket mUdpSocket;
     private volatile DatagramSocket mUdpAudioSocket;
 
-    // pre-allocated to avoid per-frame GC pressure in the video decode loop
     private final MediaCodec.BufferInfo mBufferInfo = new MediaCodec.BufferInfo();
 
-    // read from the network thread, written from the UI thread
     private static final int CAM_COUNT = 8;
     private static final String DEFAULT_URL = "rtsp://root:12345@192.168.1.10:554/stream=0";
     private final String[] mHosts = new String[CAM_COUNT];
-    private final boolean[] mTypes = new boolean[CAM_COUNT]; // false = TCP, true = UDP
-    private final boolean[] mCarousel = new boolean[CAM_COUNT]; // per-camera carousel participation
-    private final boolean[] mQuad = new boolean[CAM_COUNT]; // per-camera quad participation
-    private int mActive; // only accessed on the UI thread — no volatile needed
+    private final boolean[] mTypes = new boolean[CAM_COUNT];
+    private final boolean[] mCarousel = new boolean[CAM_COUNT];
+    private final boolean[] mQuad = new boolean[CAM_COUNT];
+    private int mActive;
     private volatile String mHost;
     private volatile boolean mType;
     private String mVersion = "1.0";
     private String mUserAgent = "User-Agent: OpenIPC-Decoder/1.0\r\n";
 
-    // tracks last warned unknown RTP payload type to suppress log spam on the network thread
-    private int lastUnknownPayload = -1; // only accessed on the network thread — no volatile needed
+    private int lastUnknownPayload = -1;
 
-    // RTP fragmentation unit NAL types
-    private static final int RTP_FU_H264  = 28;  // H.264 FU-A
-    private static final int RTP_FU_H265  = 49;  // H.265 FU
+    private static final int RTP_FU_H264 = 28;
+    private static final int RTP_FU_H265 = 49;
+    private static final int RTP_PT_H265 = 97;
+    private static final int RTP_PT_H264 = 96;
+    private static final int RTP_PT_PCMU_DEFAULT = 100;
 
-    // RTP dynamic payload types as negotiated in the OpenIPC camera SDP
-    private static final int RTP_PT_H265  = 97;  // H.265/HEVC video
-    private static final int RTP_PT_H264  = 96;  // H.264/AVC video
-    private static final int RTP_PT_PCMU_DEFAULT = 100; // fallback audio PT
-
-    // Parameter-set NAL types used to set BUFFER_FLAG_CODEC_CONFIG on the decoder input
-    private static final int H265_NAL_VPS = 32;  // Video Parameter Set
-    private static final int H265_NAL_SPS = 33;  // Sequence Parameter Set
-    private static final int H265_NAL_PPS = 34;  // Picture Parameter Set
+    private static final int H265_NAL_VPS = 32;
+    private static final int H265_NAL_SPS = 33;
+    private static final int H265_NAL_PPS = 34;
     private static final int H264_NAL_SPS = 7;
     private static final int H264_NAL_PPS = 8;
 
-    // inactivity threshold: reconnect if no RTP frame arrives within this period
-    private static final long WATCHDOG_MS  = 3000;
+    private static final long WATCHDOG_MS = 3000;
 
-    // audio clock rate parsed from SDP rtpmap; falls back to 8000 Hz if SDP is absent
     private volatile int audioSampleRate = 8000;
-
-    // audio payload type parsed from SDP m=audio; defaults to the OpenIPC convention
     private volatile int audioPt = RTP_PT_PCMU_DEFAULT;
-
-    // L16 encoding is big-endian per RFC 3551; set false for native-endian encodings
     private volatile boolean audioBigEndian = true;
 
-    // reference kept so we can dismiss the dialog (and destroy the WebView) on rotation
-    private Dialog mBrowserDialog; // only accessed on the UI thread — no volatile needed
+    private Dialog mBrowserDialog;
 
-    // carousel auto-switch state — all accessed on the UI thread only
     private static final int CAROUSEL_MIN_SEC = 3;
     private static final int CAROUSEL_MAX_SEC = 120;
     private static final int CAROUSEL_DEFAULT_SEC = 10;
@@ -197,8 +165,6 @@ public class Decoder extends Activity {
     private final Runnable carouselRunnable = new Runnable() {
         @Override public void run() {
             if (!carouselEnabled) return;
-            // skip this tick if the stream has not delivered any frames yet;
-            // let the current camera settle before switching
             if (activeStream && lastFrame > 0
                     && SystemClock.elapsedRealtime() - lastFrame < WATCHDOG_MS) {
                 carouselSwitch();
@@ -207,9 +173,8 @@ public class Decoder extends Activity {
         }
     };
 
-    private ExecutorService executor; // only accessed on the UI thread — no volatile needed
+    private ExecutorService executor;
 
-    // quad mode: 4 simultaneous video streams in a 2x2 grid — all UI thread only
     private boolean quadEnabled;
     private QuadCell[] quadCells;
     private LinearLayout quadContainer;
@@ -220,27 +185,18 @@ public class Decoder extends Activity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.decoder);
 
+        // Start web server
+        startWebServer();
 
-
-        //web server adds
-    startWebServer();
-
-        // Проверяем сохраненные настройки
-    SharedPreferences pref = getSharedPreferences("settings", MODE_PRIVATE);
-    Log.d(TAG, "Saved settings check:");
-    for (int i = 0; i < 8; i++) {
-        String url = pref.getString("host_" + i, null);
-        if (url != null) {
-            Log.d(TAG, "Camera " + i + ": " + url);
+        // Check saved settings
+        SharedPreferences pref = getSharedPreferences("settings", MODE_PRIVATE);
+        Log.d(TAG, "Saved settings check:");
+        for (int i = 0; i < 8; i++) {
+            String url = pref.getString("host_" + i, null);
+            if (url != null) {
+                Log.d(TAG, "Camera " + i + ": " + url);
+            }
         }
-    }
-
-
-         mConnect = findViewById(R.id.text_connect);
-    if (mConnect != null) {
-        mConnect.setTextColor(Color.LTGRAY);
-    }
-        //
 
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -248,7 +204,6 @@ public class Decoder extends Activity {
                         .getPackageInfo(getPackageName(), PackageManager.PackageInfoFlags.of(0))
                         .versionName;
             } else {
-                //noinspection deprecation
                 mVersion = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
             }
         } catch (PackageManager.NameNotFoundException ignored) {}
@@ -257,7 +212,6 @@ public class Decoder extends Activity {
 
         mSurface = findViewById(R.id.video_surface);
         mSurface.setKeepScreenOn(true);
-        // capture the rendering Surface on the UI thread via TextureView listener
         mSurface.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
             @Override public void onSurfaceTextureAvailable(android.graphics.SurfaceTexture st, int w, int h) {
                 replaceSurface(new Surface(st));
@@ -272,7 +226,6 @@ public class Decoder extends Activity {
             @Override public void onSurfaceTextureUpdated(android.graphics.SurfaceTexture st) {}
         });
 
-        // Pinch-to-zoom
         mScaleDetector = new ScaleGestureDetector(this, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
             @Override public boolean onScale(ScaleGestureDetector d) {
                 mZoomScale = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, mZoomScale * d.getScaleFactor()));
@@ -281,7 +234,7 @@ public class Decoder extends Activity {
                 return true;
             }
         });
-        // Pan (scroll) and double-tap to reset zoom, single tap opens menu
+
         final View menuAnchor = findViewById(R.id.decoder);
         mGestureDetector = new GestureDetector(this, new GestureDetector.SimpleOnGestureListener() {
             @Override public boolean onScroll(MotionEvent e1, MotionEvent e2, float dx, float dy) {
@@ -309,7 +262,6 @@ public class Decoder extends Activity {
             return true;
         });
 
-        // quad mode: 2x2 grid of TextureViews, initially hidden
         quadContainer = new LinearLayout(this);
         quadContainer.setOrientation(LinearLayout.VERTICAL);
         quadContainer.setVisibility(View.GONE);
@@ -330,7 +282,7 @@ public class Decoder extends Activity {
         root.addView(quadContainer, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT));
-        // codec type will be set by SDP parser; no default needed
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             WindowInsetsController ctrl = getWindow().getInsetsController();
             if (ctrl != null) {
@@ -339,12 +291,9 @@ public class Decoder extends Activity {
                         WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
             }
         } else {
-            //noinspection deprecation
             getWindow().getDecorView().setSystemUiVisibility(
                     View.SYSTEM_UI_FLAG_HIDE_NAVIGATION);
         }
-
-        // Menu is opened via single-tap in the gesture detector above
 
         Thread.setDefaultUncaughtExceptionHandler((thread, throwable) -> {
             Log.e(TAG, "Uncaught exception", throwable);
@@ -361,7 +310,6 @@ public class Decoder extends Activity {
     private void loadSettings() {
         SharedPreferences pref = getSharedPreferences("settings", MODE_PRIVATE);
 
-        // migrate legacy single-camera settings to slot 0
         if (pref.contains("host") && !pref.contains("host_0")) {
             SharedPreferences.Editor edit = pref.edit();
             edit.putString("host_0", pref.getString("host", DEFAULT_URL));
@@ -393,23 +341,16 @@ public class Decoder extends Activity {
         }
     }
 
-    /** Strip CR/LF to prevent CRLF injection into RTSP header lines. */
     private static String sanitizeUrl(String url) {
         return url.replaceAll("[\r\n]", "");
     }
 
-    /** Copy the active slot values into the volatile fields read by the network thread. */
     private void applyActiveCamera() {
         mHost = mHosts[mActive];
         mType = mTypes[mActive];
         resetZoom();
     }
 
-    /**
-     * Lightweight camera switch for carousel mode.
-     * Avoids full saveSettings() overhead — only updates the active slot,
-     * tears down the current stream, and lets the network thread reconnect.
-     */
     private void carouselSwitch() {
         int start = mActive;
         int next = -1;
@@ -427,18 +368,14 @@ public class Decoder extends Activity {
         mActive = next;
         applyActiveCamera();
 
-        // tear down current stream so the network thread reconnects to the new host
         activeStream = false;
         closeSockets();
 
-        // discard stale frames from the previous camera
         nalQueue.clear();
         pcmQueue.clear();
         closeDecoder();
         closeAudio();
 
-        // reset frame timestamp so the watchdog and next carousel tick
-        // wait for actual data from the new camera
         lastFrame = 0;
         lastWidth = 0;
         lastHeight = 0;
@@ -465,11 +402,9 @@ public class Decoder extends Activity {
             .apply();
     }
 
-    /** Enter quad mode: stop single stream, show 2x2 grid, start 4 independent cells. */
     private void startQuad() {
         if (carouselEnabled) stopCarousel();
 
-        // stop single-stream playback
         if (listener) {
             listenerGen++;
             listener = false;
@@ -485,7 +420,6 @@ public class Decoder extends Activity {
         mSurface.setVisibility(View.GONE);
         quadContainer.setVisibility(View.VISIBLE);
 
-        // collect first 4 cameras with quad enabled
         quadCells = new QuadCell[4];
         int count = 0;
         for (int i = 0; i < CAM_COUNT && count < 4; i++) {
@@ -502,7 +436,6 @@ public class Decoder extends Activity {
                 .putBoolean("quad_enabled", true).apply();
     }
 
-    /** Exit quad mode: stop all cells, show single stream. */
     private void stopQuad() {
         quadEnabled = false;
         getSharedPreferences("settings", MODE_PRIVATE).edit()
@@ -518,38 +451,31 @@ public class Decoder extends Activity {
         quadContainer.setVisibility(View.GONE);
         mSurface.setVisibility(View.VISIBLE);
 
-        // restart single-stream playback
         if (!listener) {
             listener = true;
             startListener();
         }
     }
 
-private void saveSettings() {
-    SharedPreferences pref = getSharedPreferences("settings", MODE_PRIVATE);
-    SharedPreferences.Editor edit = pref.edit();
-    edit.putInt("active", mActive);
-    edit.putBoolean("carousel_enabled", carouselEnabled);
-    edit.putInt("carousel_interval", carouselInterval);
-    for (int i = 0; i < CAM_COUNT; i++) {
-        edit.putString("host_" + i, mHosts[i]);
-        edit.putBoolean("type_" + i, mTypes[i]);
-        edit.putBoolean("carousel_" + i, mCarousel[i]);
-        edit.putBoolean("quad_" + i, mQuad[i]);
-    }
-    edit.apply();
+    private void saveSettings() {
+        SharedPreferences pref = getSharedPreferences("settings", MODE_PRIVATE);
+        SharedPreferences.Editor edit = pref.edit();
+        edit.putInt("active", mActive);
+        edit.putBoolean("carousel_enabled", carouselEnabled);
+        edit.putInt("carousel_interval", carouselInterval);
+        for (int i = 0; i < CAM_COUNT; i++) {
+            edit.putString("host_" + i, mHosts[i]);
+            edit.putBoolean("type_" + i, mTypes[i]);
+            edit.putBoolean("carousel_" + i, mCarousel[i]);
+            edit.putBoolean("quad_" + i, mQuad[i]);
+        }
+        edit.apply();
 
-    applyActiveCamera();
-    activeStream = false;
-    closeSockets();
-    
-    // Уведомляем веб-сервер о изменениях (он может обновить свои кэши)
-    if (webServer != null) {
-        // Можно добавить метод для обновления кэша в WebServer
+        applyActiveCamera();
+        activeStream = false;
+        closeSockets();
     }
-}
 
-    /** Close all active network sockets to unblock I/O threads. */
     private void closeSockets() {
         Socket tcp = mTcpSocket;
         if (tcp != null) try { tcp.close(); } catch (Exception ignored) {}
@@ -563,13 +489,10 @@ private void saveSettings() {
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
 
-        // compact width for the main menu; expanded to full screen in Settings mode
         PopupWindow popup = new PopupWindow(layout, LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT, true);
         popup.showAtLocation(menu, Gravity.TOP | Gravity.START, 0, 0);
 
-        // camRow must be WRAP_CONTENT to anchor the popup width to all 8 buttons;
-        // other menu items use default MATCH_PARENT to stretch and align uniformly
         LinearLayout camRow = new LinearLayout(this);
         camRow.setOrientation(LinearLayout.HORIZONTAL);
         LinearLayout.LayoutParams wrapParams = new LinearLayout.LayoutParams(
@@ -612,7 +535,6 @@ private void saveSettings() {
             mCarousel[mActive] = !mCarousel[mActive];
             carouselCamToggle.setText(mCarousel[mActive]
                     ? "Carousel: YES" : "Carousel: NO");
-            // save only the carousel flag — no need to disconnect the active stream
             getSharedPreferences("settings", MODE_PRIVATE).edit()
                     .putBoolean("carousel_" + mActive, mCarousel[mActive]).apply();
         });
@@ -656,7 +578,6 @@ private void saveSettings() {
             });
         }
 
-        // carousel controls
         LinearLayout carouselPanel = new LinearLayout(this);
         carouselPanel.setOrientation(LinearLayout.VERTICAL);
         carouselPanel.setVisibility(View.GONE);
@@ -679,14 +600,11 @@ private void saveSettings() {
         intervalEdit.setTextColor(Color.WHITE);
         intervalEdit.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
         intervalEdit.setPadding(dp(4), dp(6), dp(8), dp(6));
-        // Use setMaxLines instead of setSingleLine — setSingleLine breaks IME_ACTION_DONE
-        // on numeric keyboards (Android TV); matches the pattern from createEdit (URL field)
         intervalEdit.setMaxLines(1);
         intervalEdit.setImeOptions(EditorInfo.IME_ACTION_DONE);
         intervalRow.addView(intervalEdit, new LinearLayout.LayoutParams(
                 0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
-        // apply interval: triggered by IME Done, Enter key, or focus loss
         Runnable applyInterval = () -> {
             try {
                 int val = Integer.parseInt(intervalEdit.getText().toString().trim());
@@ -712,7 +630,6 @@ private void saveSettings() {
             return false;
         });
 
-        // border highlight + apply value on focus loss (D-pad navigation away)
         GradientDrawable intervalBorder = new GradientDrawable();
         intervalBorder.setColor(Color.BLACK);
         intervalBorder.setStroke(1, Color.GRAY);
@@ -751,10 +668,18 @@ private void saveSettings() {
             if (quadEnabled) stopQuad(); else startQuad();
         });
 
+        // Web Settings button
+        TextView webSettings = createItem("🌐 Web Settings");
+        layout.addView(webSettings);
+        webSettings.setOnClickListener(v -> {
+            popup.dismiss();
+            openWebSettings();
+        });
+
         String code = "Exit [V" + mVersion + "]";
 
         SpannableString s = new SpannableString(code);
-        s.setSpan(new SuperscriptSpan(),    5, s.length(), 0);
+        s.setSpan(new SuperscriptSpan(), 5, s.length(), 0);
         s.setSpan(new RelativeSizeSpan(0.5f), 5, s.length(), 0);
 
         View divider = new View(this);
@@ -776,46 +701,42 @@ private void saveSettings() {
             carouselToggle.setVisibility(closing ? View.VISIBLE : View.GONE);
             carouselPanel.setVisibility(View.GONE);
             quadToggle.setVisibility(closing ? View.VISIBLE : View.GONE);
+            webSettings.setVisibility(closing ? View.VISIBLE : View.GONE);
             divider.setVisibility(closing ? View.VISIBLE : View.GONE);
             exit.setVisibility(closing ? View.VISIBLE : View.GONE);
-            // expand to full width for the URL field; shrink back for the main menu
             popup.update(closing ? LinearLayout.LayoutParams.WRAP_CONTENT
                     : LinearLayout.LayoutParams.MATCH_PARENT,
                     LinearLayout.LayoutParams.WRAP_CONTENT);
         });
+    }
 
-//web server adds
-
-         TextView webSettings = createItem("🌐 Web Settings");
-    layout.addView(webSettings);
-    webSettings.setOnClickListener(v -> {
-        popup.dismiss();
+    private void openWebSettings() {
         try {
-            // Получаем IP адрес устройства
             java.net.NetworkInterface networkInterface = java.net.NetworkInterface.getByName("wlan0");
-            java.util.Enumeration<java.net.InetAddress> addresses = networkInterface.getInetAddresses();
-            while (addresses.hasMoreElements()) {
-                java.net.InetAddress addr = addresses.nextElement();
-                if (!addr.isLoopbackAddress() && addr.getAddress().length == 4) {
-                    String ip = addr.getHostAddress();
-                    Intent browserIntent = new Intent(Intent.ACTION_VIEW, 
-                        Uri.parse("http://" + ip + ":8080"));
-                    startActivity(browserIntent);
-                    break;
+            if (networkInterface == null) {
+                networkInterface = java.net.NetworkInterface.getByName("eth0");
+            }
+            if (networkInterface != null) {
+                java.util.Enumeration<java.net.InetAddress> addresses = networkInterface.getInetAddresses();
+                while (addresses.hasMoreElements()) {
+                    java.net.InetAddress addr = addresses.nextElement();
+                    if (!addr.isLoopbackAddress() && addr.getAddress().length == 4) {
+                        String ip = addr.getHostAddress();
+                        Intent browserIntent = new Intent(Intent.ACTION_VIEW,
+                                Uri.parse("http://" + ip + ":8080"));
+                        startActivity(browserIntent);
+                        return;
+                    }
                 }
             }
+            android.widget.Toast.makeText(this,
+                    "Cannot get IP address. Make sure Wi-Fi is connected.",
+                    android.widget.Toast.LENGTH_SHORT).show();
         } catch (Exception e) {
             Log.e(TAG, "Cannot open web settings: " + e.getMessage());
-            android.widget.Toast.makeText(this, 
-                "Cannot get IP address", android.widget.Toast.LENGTH_SHORT).show();
+            android.widget.Toast.makeText(this,
+                    "Error: " + e.getMessage(), android.widget.Toast.LENGTH_SHORT).show();
         }
-    });
-//
-
-
-
-
-        
     }
 
     private TextView createItem(String title) {
@@ -825,11 +746,9 @@ private void saveSettings() {
         text.setTextColor(Color.WHITE);
         text.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
         focusChange(text);
-
         return text;
     }
 
-    /** Apply blue highlight to the active camera button. */
     private void highlightItem(TextView item) {
         GradientDrawable bg = new GradientDrawable();
         bg.setColor(Color.BLACK);
@@ -838,7 +757,6 @@ private void saveSettings() {
         item.setTextColor(Color.CYAN);
     }
 
-    /** Reset camera button to default style. */
     private void resetItem(TextView item) {
         item.setTextColor(Color.WHITE);
         focusChange(item);
@@ -851,12 +769,10 @@ private void saveSettings() {
         text.setTextColor(Color.WHITE);
         text.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
         text.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
-        // Show only the beginning of the URL (first ~20 chars), single line
         text.setMaxLines(1);
         text.setImeOptions(EditorInfo.IME_ACTION_DONE);
         text.setSelection(0);
         focusChange(text);
-
         return text;
     }
 
@@ -876,7 +792,6 @@ private void saveSettings() {
         });
     }
 
-    /** Converts dp units to pixels using cached display density. */
     private int dp(float dp) {
         return (int) (dp * mDensity + 0.5f);
     }
@@ -892,8 +807,6 @@ private void saveSettings() {
         WebView view = new WebView(this);
         view.getSettings().setJavaScriptEnabled(true);
 
-        // Set the auth-capable client BEFORE loadUrl so credentials are
-        // available on the very first HTTP 401 challenge.
         view.setWebViewClient(new WebViewClient() {
             @Override
             public void onReceivedHttpAuthRequest(
@@ -921,7 +834,6 @@ private void saveSettings() {
             screenWidth = (int) (getWindowManager().getCurrentWindowMetrics()
                     .getBounds().width() * 0.75);
         } else {
-            //noinspection deprecation
             DisplayMetrics dm = new DisplayMetrics();
             getWindowManager().getDefaultDisplay().getMetrics(dm);
             screenWidth = (int) (dm.widthPixels * 0.75);
@@ -930,7 +842,6 @@ private void saveSettings() {
             dialog.getWindow().setLayout(screenWidth, WindowManager.LayoutParams.MATCH_PARENT);
         }
         dialog.show();
-        // release WebView native resources when the dialog is dismissed
         dialog.setOnDismissListener(d -> view.destroy());
         mBrowserDialog = dialog;
 
@@ -938,14 +849,12 @@ private void saveSettings() {
     }
 
     private void updateResolution(int width, int height) {
-        if (width < 64 || height < 64) {  // validate incoming params to avoid division by zero
+        if (width < 64 || height < 64) {
             return;
         }
 
         Log.d(TAG, "Resolution update: " + width + "x" + height);
         runOnUiThread(() -> {
-            // getHeight() must be called on the UI thread — View dimensions are written
-            // by the layout system on the UI thread; reading them elsewhere is a data race
             int surfaceH = mSurface.getHeight();
             if (surfaceH == 0) surfaceH = getResources().getDisplayMetrics().heightPixels;
             int surfaceW = (int) ((float) surfaceH / height * width);
@@ -957,7 +866,6 @@ private void saveSettings() {
         });
     }
 
-    /** Apply current zoom scale and pan offset via TextureView matrix transform */
     private void applyZoomTransform() {
         Matrix matrix = new Matrix();
         float cx = mSurface.getWidth() / 2f;
@@ -967,7 +875,6 @@ private void saveSettings() {
         mSurface.setTransform(matrix);
     }
 
-    /** Clamp pan offset so the image edges don't go past the viewport center */
     private void clampPan() {
         float maxX = (mSurface.getWidth() * (mZoomScale - 1)) / 2f;
         float maxY = (mSurface.getHeight() * (mZoomScale - 1)) / 2f;
@@ -975,7 +882,6 @@ private void saveSettings() {
         mPanY = Math.max(-maxY, Math.min(maxY, mPanY));
     }
 
-    /** Reset zoom to default 1:1 view */
     private void resetZoom() {
         mZoomScale = ZOOM_MIN;
         mPanX = 0f;
@@ -983,7 +889,6 @@ private void saveSettings() {
         applyZoomTransform();
     }
 
-    /** Release the previous Surface (if any) and store the new one. */
     private void replaceSurface(Surface next) {
         Surface prev = mVideoSurface;
         mVideoSurface = next;
@@ -1000,7 +905,7 @@ private void saveSettings() {
         int cpSize = 12;
         rxSize -= cpSize;
 
-        if (rxSize <= 0) {  // packet must have at least 1 byte of RTP payload
+        if (rxSize <= 0) {
             Log.w(TAG, "RTP payload too short: " + frame.length());
             return null;
         }
@@ -1011,17 +916,14 @@ private void saveSettings() {
 
         if (lastCodec != codecH265) {
             lastCodec = codecH265;
-            nalSize = 0;   // discard partial NAL fragment from the previous codec
-            nalQueue.clear(); // discard fully-assembled frames from the previous codec —
-                              // feeding H.264 frames to an H.265 decoder (or vice versa)
-                              // causes decoding errors and visual corruption
+            nalSize = 0;
+            nalQueue.clear();
             closeDecoder();
             Log.d(TAG, "Set codec to " + (codecH265 ? "H265" : "H264"));
         }
 
         int fragment = getFragment(rxBuffer[cpSize]);
         if (fragment == RTP_FU_H264 || fragment == RTP_FU_H265) {
-            // fragmented NAL: H.265 FU needs 3 bytes header, H.264 FU-A needs 2
             int minPayload = codecH265 ? 3 : 2;
             if (rxSize < minPayload) {
                 Log.w(TAG, "FU header too short: " + rxSize);
@@ -1054,14 +956,11 @@ private void saveSettings() {
                 nalBuffer[2] = 0;
                 nalBuffer[3] = 1;
 
-                // Skip the FU header byte whose type bits were already extracted above.
-                // nalBit++ also steps past the NAL header byte(s) already placed in
-                // nalBuffer[4] (H.264) or nalBuffer[4,5] (H.265) — keeping them intact.
                 nalBit++;
                 cpSize++;
                 rxSize--;
 
-                if (nalBit + rxSize > nalBuffer.length) {  // guard: start fragment overflow
+                if (nalBit + rxSize > nalBuffer.length) {
                     Log.e(TAG, "NAL start fragment too large, dropping");
                     nalSize = 0;
                     return null;
@@ -1070,7 +969,6 @@ private void saveSettings() {
                 nalSize = rxSize + nalBit;
 
                 if (endBit > 0) {
-                    // single-fragment NAL (start and end both set): flush as a complete frame
                     byte[] output = new byte[nalSize];
                     System.arraycopy(nalBuffer, 0, output, 0, nalSize);
                     return new Frame(output, nalSize);
@@ -1079,7 +977,7 @@ private void saveSettings() {
                 cpSize++;
                 rxSize--;
 
-                if (nalSize + rxSize > nalBuffer.length) {  // guard: accumulated overflow
+                if (nalSize + rxSize > nalBuffer.length) {
                     Log.e(TAG, "NAL buffer overflow, dropping frame");
                     nalSize = 0;
                     return null;
@@ -1099,7 +997,7 @@ private void saveSettings() {
             nalBuffer[2] = 0;
             nalBuffer[3] = 1;
 
-            if (nalBit + rxSize > nalBuffer.length) {  // guard: single-NAL overflow
+            if (nalBit + rxSize > nalBuffer.length) {
                 Log.e(TAG, "Single NAL too large (" + rxSize + " bytes), dropping");
                 return null;
             }
@@ -1111,33 +1009,28 @@ private void saveSettings() {
             return new Frame(output, nalSize);
         }
 
-        // middle fragment: accumulating, frame not yet complete
         return null;
     }
 
     private void playAudio(Frame data) {
-        // snapshot to a local: onPause() can null audioTrack from the UI thread at any moment
         AudioTrack track = audioTrack;
         if (track == null) {
-            if (!audioFailed) {  // skip retry if init already failed for this session
+            if (!audioFailed) {
                 createAudio();
             }
         } else {
-            // write() may return a positive number less than the requested length;
-            // loop until all bytes are consumed or a fatal error is reported.
-            // Re-snapshot audioTrack on each iteration: closeAudio() can null it at any moment.
             byte[] buf = data.data();
             int offset = 0;
             int remaining = data.length();
             while (remaining > 0) {
-                AudioTrack t = audioTrack; // re-check: UI thread may have called closeAudio()
+                AudioTrack t = audioTrack;
                 if (t == null) break;
                 int written = t.write(buf, offset, remaining);
                 if (written < 0) {
                     Log.e(TAG, "AudioTrack.write() error: " + written);
                     break;
                 }
-                offset    += written;
+                offset += written;
                 remaining -= written;
             }
         }
@@ -1146,14 +1039,12 @@ private void saveSettings() {
     private void processAudio(Frame frame) {
         int header = 12;
         int length = frame.length() - header;
-        if (length <= 0) {  // ignore malformed packets shorter than the RTP header
+        if (length <= 0) {
             return;
         }
 
-        // allocate final buffer directly — avoids staging + copyOf double-copy
         byte[] queued = new byte[length];
         System.arraycopy(frame.data(), header, queued, 0, length);
-        // swap bytes only for big-endian encodings (L16 per RFC 3551)
         if (audioBigEndian) {
             for (int i = 0; i + 1 < length; i += 2) {
                 byte tmp = queued[i];
@@ -1162,26 +1053,23 @@ private void saveSettings() {
             }
         }
 
-        // non-blocking offer — drop frame immediately if queue is full
         if (!pcmQueue.offer(new Frame(queued, length))) {
             Log.w(TAG, "Audio queue full, frame dropped");
         }
     }
 
     private void createAudio() {
-        // use the clock rate extracted from SDP; falls back to the 8000 Hz default
         int sample = audioSampleRate;
         int format = AudioFormat.CHANNEL_OUT_MONO;
 
         Log.d(TAG, "Create audio decoder (" + sample + "hz)");
         int size = AudioTrack.getMinBufferSize(sample, format, AudioFormat.ENCODING_PCM_16BIT);
-        if (size <= 0) {  // ERROR (-1) or ERROR_BAD_VALUE (-2): unsupported sample rate
+        if (size <= 0) {
             Log.e(TAG, "Invalid audio parameters: sample=" + sample + " bufSize=" + size);
             audioFailed = true;
             return;
         }
 
-        // AudioTrack.Builder replaces the deprecated stream-based constructor (API 21+)
         AudioTrack track = new AudioTrack.Builder()
                 .setAudioAttributes(new AudioAttributes.Builder()
                         .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -1196,19 +1084,16 @@ private void saveSettings() {
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build();
         if (track.getState() != AudioTrack.STATE_INITIALIZED) {
-            // resource exhaustion or invalid config at the OS audio layer
             Log.e(TAG, "AudioTrack failed to initialize, releasing");
             track.release();
             audioFailed = true;
             return;
         }
 
-        // publish to the volatile field only after the track is fully ready
         audioTrack = track;
         try {
             track.play();
         } catch (Exception e) {
-            // play() can throw on resource exhaustion; release to avoid a native-handle leak
             audioTrack = null;
             track.release();
             Log.e(TAG, "AudioTrack.play() failed", e);
@@ -1219,8 +1104,6 @@ private void saveSettings() {
     private void closeAudio() {
         AudioTrack track = audioTrack;
         if (track != null) {
-            // null the field BEFORE stop/release: any concurrent playAudio() snapshot
-            // will then see null and skip, rather than writing to a released AudioTrack
             audioTrack = null;
             Log.i(TAG, "Close audio decoder");
             try {
@@ -1230,11 +1113,11 @@ private void saveSettings() {
                 Log.e(TAG, "Audio close exception", e);
             }
         }
-        audioFailed = false; // allow re-init on the next session
+        audioFailed = false;
     }
 
     private void decodeFrame(Frame buffer) {
-        if (buffer.length() < 5) { // need at least 4-byte start code + 1 NAL type byte
+        if (buffer.length() < 5) {
             Log.w(TAG, "NAL frame too short: " + buffer.length());
             return;
         }
@@ -1243,7 +1126,6 @@ private void saveSettings() {
 
         int flag = 0;
         int fragment = getFragment(buffer.data()[4]);
-        // mark parameter-set NALs so the decoder can configure itself before the first frame
         boolean isConfigNal = codecH265
                 ? (fragment == H265_NAL_VPS || fragment == H265_NAL_SPS || fragment == H265_NAL_PPS)
                 : (fragment == H264_NAL_SPS || fragment == H264_NAL_PPS);
@@ -1251,41 +1133,34 @@ private void saveSettings() {
             flag = MediaCodec.BUFFER_FLAG_CODEC_CONFIG;
         }
 
-        // Hold decoderLock for the entire codec operation: closeDecoder() (called from the
-        // network thread on codec-switch) must not call stop()/release() while we are still
-        // feeding buffers or dequeuing output — MediaCodec is not thread-safe for that.
         boolean needCreate = false;
         synchronized (decoderLock) {
             MediaCodec codec = mDecoder;
             if (codec == null) {
-                needCreate = !decoderFailed; // createDecoder() acquires decoderLock itself
+                needCreate = !decoderFailed;
             } else {
                 try {
-                    // 5 ms timeout: gives the codec a chance to free a slot under load
-                    // instead of immediately returning -1 and silently dropping the frame
                     int inputBufferId = codec.dequeueInputBuffer(5_000);
                     if (inputBufferId >= 0) {
                         ByteBuffer inputBuffer = codec.getInputBuffer(inputBufferId);
                         if (inputBuffer != null) {
-                            inputBuffer.clear(); // reset position/limit — dequeue does not guarantee this
+                            inputBuffer.clear();
                             inputBuffer.put(buffer.data(), 0, buffer.length());
                             codec.queueInputBuffer(inputBufferId, 0,
                                     buffer.length(), System.nanoTime() / 1000, flag);
                         }
                     }
 
-                    // drain all available output buffers — the codec may have
-                    // multiple frames ready after a single input submission
                     MediaCodec.BufferInfo info = mBufferInfo;
                     int outputBufferId;
                     while ((outputBufferId = codec.dequeueOutputBuffer(info, 0)) >= 0
                             || outputBufferId == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                         if (outputBufferId == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                             MediaFormat format = codec.getOutputFormat();
-                            int mWidth  = format.getInteger(MediaFormat.KEY_WIDTH);
+                            int mWidth = format.getInteger(MediaFormat.KEY_WIDTH);
                             int mHeight = format.getInteger(MediaFormat.KEY_HEIGHT);
                             if (lastWidth != mWidth || lastHeight != mHeight) {
-                                lastWidth  = mWidth;
+                                lastWidth = mWidth;
                                 lastHeight = mHeight;
                                 updateResolution(lastWidth, lastHeight);
                             }
@@ -1295,26 +1170,21 @@ private void saveSettings() {
                     }
                 } catch (Exception e) {
                     Log.e(TAG, "Codec exception: " + e.getMessage());
-                    // mark failed so the video thread won't retry until a new stream arrives
                     mDecoder = null;
                     decoderFailed = true;
-                    try { codec.stop();    } catch (Exception ignored) {}
+                    try { codec.stop(); } catch (Exception ignored) {}
                     try { codec.release(); } catch (Exception ignored) {}
                 }
             }
         }
-        // createDecoder() acquires decoderLock internally — must be called outside our block
         if (needCreate) createDecoder();
     }
 
     private void createDecoder() {
-        // fast pre-check before allocating anything
         synchronized (decoderLock) {
-            if (mDecoder != null) return; // already running — avoid double-init and native leak
+            if (mDecoder != null) return;
         }
 
-        // use the Surface captured on the UI thread — getSurface() is not thread-safe to call
-        // from the network thread directly (the TextureView listener populates mVideoSurface)
         Surface mVideo = mVideoSurface;
         if (mVideo == null || !mVideo.isValid()) {
             return;
@@ -1323,41 +1193,32 @@ private void saveSettings() {
         String type = codecH265 ? "video/hevc" : "video/avc";
 
         MediaFormat format = MediaFormat.createVideoFormat(type, 1280, 720);
-        // pre-declare the max input size to match our NAL buffer; prevents
-        // BufferOverflowException when a large intra-frame arrives
         format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 1024 * 1024);
 
         MediaCodec local;
         try {
             Log.i(TAG, "Start video decoder");
             local = MediaCodec.createDecoderByType(type);
-            // configure() and start() are split from createDecoderByType() so that
-            // if either throws, we can release() the already-created codec object —
-            // otherwise the native handle leaks until the next GC cycle
             try {
                 local.configure(format, mVideo, null, 0);
                 local.start();
             } catch (Exception e) {
-                local.release(); // prevent native MediaCodec handle leak
+                local.release();
                 throw e;
             }
         } catch (Exception e) {
             Log.e(TAG, "Cannot setup decoder: " + e.getMessage());
-            decoderFailed = true; // codec likely unsupported; stop retrying until next session
+            decoderFailed = true;
             return;
         }
 
         synchronized (decoderLock) {
             if (mDecoder != null) {
-                // another thread created the decoder while we were outside the lock; discard ours
                 local.release();
                 return;
             }
             mDecoder = local;
         }
-        // reset the watchdog baseline: decodeFrame() only updates lastFrame after the codec
-        // is ready, so the first call (codec==null path) returns early without touching it.
-        // Without this, a keyframe interval > 3s would trigger a spurious stream disconnect.
         lastFrame = SystemClock.elapsedRealtime();
         updateResolution(lastWidth, lastHeight);
     }
@@ -1368,8 +1229,6 @@ private void saveSettings() {
             if (codec == null) { decoderFailed = false; return; }
             mDecoder = null;
             Log.i(TAG, "Close video decoder");
-            // release inside the lock: prevents createDecoder() from allocating a second
-            // codec instance while the old one is still held by the hardware pipeline
             try {
                 codec.stop();
                 codec.release();
@@ -1380,14 +1239,8 @@ private void saveSettings() {
         }
     }
 
-    /**
-     * Reads one CRLF-terminated line from a raw InputStream without any internal buffering,
-     * so the stream position is left exactly after the '\n' — no bytes are consumed in advance.
-     * A BufferedReader/BufferedInputStream must NOT be used here: after PLAY the camera
-     * immediately starts sending RTP data, and any pre-read bytes would be silently lost.
-     */
     private static String readLine(InputStream in) throws IOException {
-        StringBuilder sb = new StringBuilder(128); // pre-sized for a typical header line
+        StringBuilder sb = new StringBuilder(128);
         int c;
         while ((c = in.read()) != -1) {
             if (c == '\n') return sb.toString();
@@ -1399,17 +1252,11 @@ private void saveSettings() {
         return sb.length() > 0 ? sb.toString() : null;
     }
 
-    /**
-     * Reads a complete RTSP response (status line + headers until blank line).
-     * Throws IOException if the status code is not 2xx.
-     * Returns the trimmed value of {@code targetHeader}, or null if the header is absent.
-     */
     private static String readRtspResponse(InputStream in, String targetHeader) throws IOException {
         String status = readLine(in);
         if (status == null) throw new IOException("Server closed connection during handshake");
         Log.i(TAG, status);
 
-        // validate that the response is a 2xx success
         String[] parts = status.split(" ", 3);
         if (parts.length < 2) throw new IOException("Malformed RTSP response: " + status);
         try {
@@ -1419,35 +1266,22 @@ private void saveSettings() {
             throw new IOException("Malformed RTSP status code: " + status);
         }
 
-        // read remaining headers until the blank separator line
         String found = null;
         String line;
         while ((line = readLine(in)) != null && !line.isEmpty()) {
             Log.i(TAG, line);
-            // RFC 2326: header names are case-insensitive
             if (targetHeader != null && line.toLowerCase(Locale.ROOT)
                     .startsWith(targetHeader.toLowerCase(Locale.ROOT))) {
-                // extract value, stripping optional parameters (e.g. "Session: abc;timeout=60")
                 found = line.substring(targetHeader.length()).split(";")[0].trim();
             }
         }
         return found;
     }
 
-    /**
-     * Parses the full SDP body in a single pass (RFC 4566), extracting:
-     * <ul>
-     *   <li>audio clock rate → stored in {@link #audioSampleRate}</li>
-     *   <li>video codec (H.264 vs H.265) → stored in {@link #codecH265}</li>
-     *   <li>per-track Control URLs (RFC 2326 §C.1.1) → returned as [video, audio]</li>
-     * </ul>
-     * Absolute {@code a=control:} values are used as-is; relative values are resolved
-     * against {@code baseUrl}. Falls back to "{@code baseUrl}/trackID=N" if absent.
-     */
     private String[] parseSdp(String sdp, String baseUrl) {
-        String base = baseUrl; // may be overridden by session-level a=control:
+        String base = baseUrl;
         String[] controls = { null, null };
-        int track = -1; // -1 = session section, 0 = video, 1 = audio
+        int track = -1;
 
         for (String line : sdp.split("[\r\n]+")) {
             if (line.startsWith("m=video")) {
@@ -1463,7 +1297,6 @@ private void saveSettings() {
                 }
             } else if (line.startsWith("m=audio")) {
                 track = 1;
-                // parse audio payload type from "m=audio <port> RTP/AVP <pt>"
                 String[] parts = line.split("\\s+");
                 if (parts.length >= 4) {
                     try {
@@ -1474,7 +1307,6 @@ private void saveSettings() {
             } else if (line.startsWith("a=control:")) {
                 String ctrl = line.substring("a=control:".length()).trim();
                 if (track == -1) {
-                    // session-level control: override base URL (RFC 2326 §C.1.1)
                     base = ctrl.startsWith("rtsp://") ? ctrl : baseUrl + "/" + ctrl;
                 } else {
                     controls[track] = ctrl.startsWith("rtsp://") ? ctrl : base + "/" + ctrl;
@@ -1499,15 +1331,14 @@ private void saveSettings() {
                 }
             }
         }
-        // apply defaults for tracks without explicit control
         if (controls[0] == null) controls[0] = base + "/trackID=0";
         if (controls[1] == null) controls[1] = base + "/trackID=1";
         return controls;
     }
 
     private void rtspConnect() throws Exception {
-        nalSize = 0; // discard any partial NAL fragment from the previous session
-        lastUnknownPayload = -1; // reset so warnings appear for each new session
+        nalSize = 0;
+        lastUnknownPayload = -1;
         String currentHost = mHost;
         if (currentHost == null || currentHost.isEmpty()) {
             throw new IOException("Camera slot not configured");
@@ -1521,8 +1352,6 @@ private void saveSettings() {
             int port = uri.getPort();
             s.connect(new InetSocketAddress(host, port < 0 ? 554 : port), 1000);
             s.setSoTimeout(1000);
-            // use the raw InputStream — a BufferedReader would pre-read RTP stream bytes
-            // into its internal buffer, making them unavailable to tcpStream()
             InputStream input = s.getInputStream();
             OutputStream w = s.getOutputStream();
 
@@ -1534,15 +1363,12 @@ private void saveSettings() {
                 auth = "Authorization: Basic " +
                         Base64.encodeToString(user.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP) + "\r\n";
             }
-            // Strip userinfo from the request-line URL: credentials belong only in the
-            // Authorization header — including them in the URL leaks them to server access logs.
             String path = uri.getEncodedPath();
             String query = uri.getEncodedQuery();
-            // include query string (?param=value) — some cameras embed channel or stream IDs there
             String rtspUrl = uri.getScheme() + "://" + host
                     + (port >= 0 ? ":" + port : "")
-                    + (path  != null ? path         : "")
-                    + (query != null ? "?" + query  : "");
+                    + (path != null ? path : "")
+                    + (query != null ? "?" + query : "");
 
             int seq = 1;
             String desc = "DESCRIBE " + rtspUrl + " RTSP/1.0\r\n" +
@@ -1550,28 +1376,23 @@ private void saveSettings() {
             w.write(desc.getBytes(StandardCharsets.UTF_8));
             w.flush();
 
-            // read DESCRIBE response; capture Content-Length to skip the SDP body
             String contentLenStr = readRtspResponse(input, "Content-Length:");
             int sdpBodyLen = 0;
             if (contentLenStr != null) {
                 try { sdpBodyLen = Integer.parseInt(contentLenStr); }
                 catch (NumberFormatException ignored) {}
             }
-            // read SDP body; parse audio clock rate, then discard the rest
             StringBuilder sdp = new StringBuilder();
             byte[] skipBuf = new byte[512];
             while (sdpBodyLen > 0) {
                 int n = input.read(skipBuf, 0, Math.min(sdpBodyLen, skipBuf.length));
-                if (n <= 0) break; // -1 = EOF; 0 = legal but unusual, avoids infinite loop
-                if (sdp.length() < 4096) // cap to avoid OOM on pathological responses
+                if (n <= 0) break;
+                if (sdp.length() < 4096)
                     sdp.append(new String(skipBuf, 0, n, StandardCharsets.UTF_8));
                 sdpBodyLen -= n;
             }
-            // single-pass SDP parse: audio rate, video codec, and per-track Control URLs
             String[] trackUrls = parseSdp(sdp.toString(), rtspUrl);
 
-            // bind to fixed ports matching the OpenIPC camera convention;
-            // SO_REUSEADDR prevents BindException on quick restart after crash
             DatagramSocket udpVideo = null;
             DatagramSocket udpAudio = null;
             if (mType) {
@@ -1592,12 +1413,10 @@ private void saveSettings() {
                 w.write(video.getBytes(StandardCharsets.UTF_8));
                 w.flush();
 
-                // read SETUP response; Session header is required to continue
                 String session = readRtspResponse(input, "Session:");
                 if (session == null) {
                     throw new IOException("RTSP server did not return a Session header");
                 }
-                // strip CR/LF to prevent the session token from injecting extra RTSP headers
                 session = session.replaceAll("[\r\n]", "");
 
                 seq++;
@@ -1620,14 +1439,9 @@ private void saveSettings() {
 
                 readRtspResponse(input, null);
 
-                // disable read timeout before streaming: keyframe intervals often exceed 1 second
                 s.setSoTimeout(0);
-                // reset watchdog baseline so the 3-second timeout counts from now,
-                // not from the epoch (lastFrame == 0 would trigger the watchdog immediately)
                 lastFrame = SystemClock.elapsedRealtime();
                 activeStream = true;
-                // pre-warm the decoder now, while first packets are still in transit;
-                // without this, createDecoder() runs on the first decoded frame (~200–500 ms later)
                 createDecoder();
                 try {
                     if (mType) {
@@ -1635,14 +1449,12 @@ private void saveSettings() {
                         mUdpAudioSocket = udpAudio;
                         final DatagramSocket audioSock = udpAudio;
                         try {
-                            // daemon thread: socket close in onPause/closeSockets unblocks receive()
                             Thread audioRx = new Thread(() -> {
                                 try { udpStream(audioSock); } catch (IOException ignored) {}
                             }, "rtsp-udp-audio");
                             audioRx.setDaemon(true);
                             audioRx.start();
                             udpStream(udpVideo);
-                            // ensure audio thread exits after video stream ends
                             audioSock.close();
                             try { audioRx.join(2000); } catch (InterruptedException ignored) {
                                 Thread.currentThread().interrupt();
@@ -1677,19 +1489,15 @@ private void saveSettings() {
     }
 
     private void udpStream(DatagramSocket d) throws IOException {
-        // wake up every second so the activeStream flag is checked even when the camera
-        // goes silent (power cycle, network loss); prevents permanent thread leak
         d.setSoTimeout(1000);
-        // single buffer reused every packet — avoids per-frame allocation at 25-30 fps
         byte[] buf = new byte[65535];
         DatagramPacket packet = new DatagramPacket(buf, buf.length);
         while (activeStream) {
             try {
                 d.receive(packet);
             } catch (SocketTimeoutException ignored) {
-                continue; // re-check activeStream
+                continue;
             }
-            // defensive copy: packet.getData() is reused on next receive()
             byte[] copy = new byte[packet.getLength()];
             System.arraycopy(packet.getData(), 0, copy, 0, packet.getLength());
             processPacket(new Frame(copy, packet.getLength()));
@@ -1697,27 +1505,24 @@ private void saveSettings() {
     }
 
     private void tcpStream(InputStream rawInput) throws IOException {
-        // wrap in BufferedInputStream to batch OS-level reads
         BufferedInputStream input = new BufferedInputStream(rawInput, 65536);
         byte[] pktBuf = new byte[65535];
         while (activeStream) {
             int b = input.read();
             if (b == -1) {
-                activeStream = false; // server closed connection cleanly — signal reconnect
+                activeStream = false;
                 break;
             }
-            if (b != 0x24) continue; // not an RTSP interleaved marker — skip
+            if (b != 0x24) continue;
 
             int channel = input.read();
             int hi = input.read();
             int lo = input.read();
             if (channel == -1 || hi == -1 || lo == -1) {
-                activeStream = false; // unexpected EOF inside interleaved header
+                activeStream = false;
                 break;
             }
             int len = (hi << 8) | lo;
-            // A zero-length or oversized packet is malformed; skip it to avoid
-            // an empty read loop or an out-of-bounds access into pktBuf.
             if (len <= 0 || len > pktBuf.length) {
                 Log.w(TAG, "Invalid RTSP interleaved packet length: " + len);
                 continue;
@@ -1731,7 +1536,6 @@ private void saveSettings() {
             }
 
             if (channel == 0 || channel == 2) {
-                // defensive copy: pktBuf is reused on next iteration
                 byte[] copy = new byte[len];
                 System.arraycopy(pktBuf, 0, copy, 0, len);
                 processPacket(new Frame(copy, len));
@@ -1740,15 +1544,12 @@ private void saveSettings() {
     }
 
     private void processPacket(Frame frame) {
-        if (frame.length() < 12) {  // RTP fixed header is exactly 12 bytes
+        if (frame.length() < 12) {
             Log.w(TAG, "RTP packet too short: " + frame.length());
             return;
         }
         byte[] data = frame.data();
 
-        // Validate that no CSRC list or header extension is present.
-        // Both shift the payload start beyond byte 12 — unsupported for now.
-        // OpenIPC cameras always send CC=0 and X=0, so this guards against malformed streams.
         int cc = data[0] & 0x0F;
         boolean hasExt = (data[0] & 0x10) != 0;
         if (cc != 0 || hasExt) {
@@ -1764,16 +1565,13 @@ private void saveSettings() {
             codecH265 = payload == RTP_PT_H265;
             Frame output = buildFrame(frame);
             if (output != null) {
-                // non-blocking offer — drop frame if queue is full
                 if (!nalQueue.offer(output)) {
                     Log.w(TAG, "Video queue full, frame dropped");
                 }
             }
-
             return;
         }
 
-        // log each new unknown payload type only once to avoid spamming the network thread
         if (payload != lastUnknownPayload) {
             lastUnknownPayload = payload;
             Log.w(TAG, "Unknown rtp type: " + payload);
@@ -1783,28 +1581,21 @@ private void saveSettings() {
     private void startListener() {
         Log.i(TAG, "Start network listener");
 
-        // Each thread captures its generation; exits as soon as onPause
-        // increments listenerGen, preventing duplicate threads on resume.
         final int gen = listenerGen;
 
         executor = Executors.newFixedThreadPool(4);
 
         executor.execute(() -> {
             Thread.currentThread().setName("rtsp-network");
-            int retryDelay = 1000; // start at 1 s, doubles up to 8 s on repeated failures
+            int retryDelay = 1000;
             while (gen == listenerGen) {
                 try {
                     if (!activeStream) {
                         rtspConnect();
-                        retryDelay = 1000; // reset backoff after any successful session
-                        // brief pause before reconnecting after a clean server-side close;
-                        // without this the loop hammers the camera with no delay
+                        retryDelay = 1000;
                         SystemClock.sleep(1000);
                     }
                 } catch (Exception e) {
-                    // reset so the next iteration re-enters the connect block;
-                    // without this, an IOException thrown after activeStream=true
-                    // leaves it stuck at true and the loop spins until the watchdog fires
                     activeStream = false;
                     Log.w(TAG, "Cannot connect rtsp: " + e.getMessage());
                     SystemClock.sleep(retryDelay);
@@ -1816,13 +1607,10 @@ private void saveSettings() {
         executor.execute(() -> {
             Thread.currentThread().setName("rtsp-watchdog");
             while (gen == listenerGen) {
-                // only check when streaming and at least one frame has been received;
-                // lastFrame == 0 means a new connection is still negotiating RTSP handshake
                 if (activeStream && lastFrame > 0
                         && SystemClock.elapsedRealtime() - lastFrame > WATCHDOG_MS) {
                     Log.w(TAG, "Stream is inactive");
                     activeStream = false;
-                    // close the TCP socket so input.read() unblocks immediately
                     Socket tcp = mTcpSocket;
                     if (tcp != null) try { tcp.close(); } catch (Exception ignored) {}
                 }
@@ -1839,7 +1627,7 @@ private void saveSettings() {
                         decodeFrame(buffer);
                     }
                 } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt(); // restore interrupt status and stop
+                    Thread.currentThread().interrupt();
                     break;
                 } catch (Exception e) {
                     Log.e(TAG, "Video decode error: " + e.getMessage());
@@ -1856,7 +1644,7 @@ private void saveSettings() {
                         playAudio(buffer);
                     }
                 } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt(); // restore interrupt status and stop
+                    Thread.currentThread().interrupt();
                     break;
                 } catch (Exception e) {
                     Log.e(TAG, "Audio playback error: " + e.getMessage());
@@ -1869,12 +1657,9 @@ private void saveSettings() {
     protected void onPause() {
         super.onPause();
         carouselHandler.removeCallbacks(carouselRunnable);
-        // dismiss any open browser dialog; its OnDismissListener will call view.destroy()
-        // preventing a WebView native-resource leak when the Activity is rotated
         Dialog browser = mBrowserDialog;
         mBrowserDialog = null;
         if (browser != null && browser.isShowing()) browser.dismiss();
-        // stop quad cells if active
         if (quadCells != null) {
             for (QuadCell cell : quadCells) {
                 if (cell != null) cell.stop();
@@ -1882,7 +1667,7 @@ private void saveSettings() {
             quadCells = null;
         }
         if (listener) {
-            listenerGen++;  // invalidate all threads from the current generation
+            listenerGen++;
             listener = false;
             activeStream = false;
             closeSockets();
@@ -1895,17 +1680,14 @@ private void saveSettings() {
             nalQueue.clear();
             pcmQueue.clear();
         }
-//web server adds
-         if (webServer != null) {
-        webServer.stopServer();
-        webServer = null;
-        if (webServerThread != null) {
-            webServerThread.interrupt();
-            webServerThread = null;
+        if (webServer != null) {
+            webServer.stopServer();
+            webServer = null;
+            if (webServerThread != null) {
+                webServerThread.interrupt();
+                webServerThread = null;
+            }
         }
-    }
-//
-        
     }
 
     @Override
@@ -1914,10 +1696,9 @@ private void saveSettings() {
 
         loadSettings();
         if (webServer == null) {
-        startWebServer();
+            startWebServer();
         }
         if (quadEnabled) {
-            // re-enter quad mode after pause/resume
             mSurface.setVisibility(View.GONE);
             quadContainer.setVisibility(View.VISIBLE);
             quadCells = new QuadCell[4];
@@ -1944,11 +1725,67 @@ private void saveSettings() {
         }
     }
 
+    // Web server methods
+    private void startWebServer() {
+        if (webServer == null) {
+            webServer = new WebServer(getSharedPreferences("settings", MODE_PRIVATE));
+            webServer.setListener(this);
+            webServerThread = new Thread(webServer);
+            webServerThread.start();
+            showWebServerAddress();
+        }
+    }
+
+    private void showWebServerAddress() {
+        try {
+            java.net.NetworkInterface networkInterface = java.net.NetworkInterface.getByName("wlan0");
+            if (networkInterface == null) {
+                networkInterface = java.net.NetworkInterface.getByName("eth0");
+            }
+            if (networkInterface != null) {
+                java.util.Enumeration<java.net.InetAddress> addresses = networkInterface.getInetAddresses();
+                while (addresses.hasMoreElements()) {
+                    java.net.InetAddress addr = addresses.nextElement();
+                    if (!addr.isLoopbackAddress() && addr.getAddress().length == 4) {
+                        String ip = addr.getHostAddress();
+                        Log.i(TAG, "========================================");
+                        Log.i(TAG, "Web Interface available at:");
+                        Log.i(TAG, "http://" + ip + ":8080");
+                        Log.i(TAG, "========================================");
+                        runOnUiThread(() -> {
+                            android.widget.Toast.makeText(this,
+                                    "🌐 WebUI: http://" + ip + ":8080",
+                                    android.widget.Toast.LENGTH_LONG).show();
+                        });
+                        break;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Cannot get IP address: " + e.getMessage());
+        }
+    }
+
+    public void onSettingsChanged() {
+        Log.i(TAG, "Settings changed from web interface, reloading...");
+        runOnUiThread(() -> {
+            loadSettings();
+            if (listener && !quadEnabled) {
+                activeStream = false;
+                closeSockets();
+                closeDecoder();
+                closeAudio();
+                nalQueue.clear();
+                pcmQueue.clear();
+            }
+            android.widget.Toast.makeText(this,
+                    "Settings updated from WebUI.\nRestarting stream...",
+                    android.widget.Toast.LENGTH_SHORT).show();
+        });
+    }
+
     /**
      * Self-contained RTSP video-only player for one quadrant cell.
-     * Uses TCP exclusively — UDP fixed ports (5000/5002) cannot be shared
-     * across multiple simultaneous streams. Audio is intentionally skipped
-     * to reduce resource usage.
      */
     private class QuadCell {
         final String host;
@@ -2016,7 +1853,6 @@ private void saveSettings() {
             if (executor != null) return;
             executor = Executors.newFixedThreadPool(3);
 
-            // network thread with exponential backoff
             executor.execute(() -> {
                 Thread.currentThread().setName(tag + "-net");
                 int retryDelay = 1000;
@@ -2034,7 +1870,6 @@ private void saveSettings() {
                 }
             });
 
-            // watchdog
             executor.execute(() -> {
                 Thread.currentThread().setName(tag + "-wd");
                 while (running) {
@@ -2048,7 +1883,6 @@ private void saveSettings() {
                 }
             });
 
-            // video decoder
             executor.execute(() -> {
                 Thread.currentThread().setName(tag + "-dec");
                 while (running) {
@@ -2120,7 +1954,6 @@ private void saveSettings() {
                         + (query != null ? "?" + query : "");
 
                 int seq = 1;
-                // DESCRIBE
                 w.write(("DESCRIBE " + rtspUrl + " RTSP/1.0\r\n" +
                         "CSeq: " + seq + "\r\n" + auth + mUserAgent +
                         "Accept: application/sdp\r\n\r\n").getBytes(StandardCharsets.UTF_8));
@@ -2142,7 +1975,6 @@ private void saveSettings() {
                     sdpLen -= n;
                 }
 
-                // parse SDP for video track only (no audio in quad mode)
                 String videoControl = null;
                 String baseControl = rtspUrl;
                 int section = -1;
@@ -2169,7 +2001,6 @@ private void saveSettings() {
                 }
                 if (videoControl == null) videoControl = baseControl + "/trackID=0";
 
-                // SETUP video — TCP only (UDP ports can't be shared across quad cells)
                 seq++;
                 w.write(("SETUP " + videoControl + " RTSP/1.0\r\n" +
                         "CSeq: " + seq + "\r\n" + auth + mUserAgent +
@@ -2181,7 +2012,6 @@ private void saveSettings() {
                 if (session == null) throw new IOException("No Session");
                 session = session.replaceAll("[\r\n]", "");
 
-                // PLAY
                 seq++;
                 w.write(("PLAY " + rtspUrl + " RTSP/1.0\r\n" +
                         "CSeq: " + seq + "\r\n" + auth + mUserAgent +
@@ -2234,7 +2064,6 @@ private void saveSettings() {
                     read += n;
                 }
 
-                // channel 0 = video RTP; skip audio (channel 2)
                 if (channel == 0) {
                     byte[] copy = new byte[len];
                     System.arraycopy(pktBuf, 0, copy, 0, len);
@@ -2263,7 +2092,6 @@ private void saveSettings() {
             return codecH265 ? (data >> 1) & 0x3F : data & 0x1F;
         }
 
-        /** NAL reassembly from RTP fragmentation units. */
         private Frame assembleNal(Frame frame) {
             byte[] rx = frame.data();
             int rxSize = frame.length();
@@ -2346,7 +2174,7 @@ private void saveSettings() {
                 return new Frame(out, nalSize);
             }
 
-            return null; // middle fragment — accumulating
+            return null;
         }
 
         private void decode(Frame buffer) {
@@ -2431,10 +2259,9 @@ private void saveSettings() {
 
     private record Frame(byte[] data, int length) {
     }
-   
+
     public boolean onKeyDown(int keyCode, KeyEvent event) {
         Log.d(TAG, "Key pressed: " + keyCode);
-        
         switch (keyCode) {
             case KeyEvent.KEYCODE_DPAD_CENTER:
             case KeyEvent.KEYCODE_ENTER:
@@ -2444,81 +2271,4 @@ private void saveSettings() {
                 return super.onKeyDown(keyCode, event);
         }
     }
-
-    //web server adds
-private void startWebServer() {
-    if (webServer == null) {
-        webServer = new WebServer(getSharedPreferences("settings", MODE_PRIVATE));
-        webServer.setListener(this); // Устанавливаем слушатель
-        webServerThread = new Thread(webServer);
-        webServerThread.start();
-        
-        // Показываем IP адрес в логе
-        showWebServerAddress();
-    }
-}
-
-private void showWebServerAddress() {
-    try {
-        java.net.NetworkInterface networkInterface = java.net.NetworkInterface.getByName("wlan0");
-        if (networkInterface == null) {
-            networkInterface = java.net.NetworkInterface.getByName("eth0");
-        }
-        if (networkInterface != null) {
-            java.util.Enumeration<java.net.InetAddress> addresses = networkInterface.getInetAddresses();
-            while (addresses.hasMoreElements()) {
-                java.net.InetAddress addr = addresses.nextElement();
-                if (!addr.isLoopbackAddress() && addr.getAddress().length == 4) {
-                    String ip = addr.getHostAddress();
-                    Log.i(TAG, "========================================");
-                    Log.i(TAG, "Web Interface available at:");
-                    Log.i(TAG, "http://" + ip + ":8080");
-                    Log.i(TAG, "========================================");
-                    
-                    // Показываем Toast с адресом
-                    runOnUiThread(() -> {
-                        android.widget.Toast.makeText(this, 
-                            "🌐 WebUI: http://" + ip + ":8080", 
-                            android.widget.Toast.LENGTH_LONG).show();
-                    });
-                    break;
-                }
-            }
-        }
-    } catch (Exception e) {
-        Log.e(TAG, "Cannot get IP address: " + e.getMessage());
-    }
-}
-
-    @Override
-public void onSettingsChanged() {
-    Log.i(TAG, "Settings changed from web interface, reloading...");
-    runOnUiThread(() -> {
-        // Перезагружаем настройки
-        loadSettings();
-        
-        // Перезапускаем стрим если он активен и не в quad режиме
-        if (listener && !quadEnabled) {
-            activeStream = false;
-            closeSockets();
-            closeDecoder();
-            closeAudio();
-            nalQueue.clear();
-            pcmQueue.clear();
-        }
-        
-        // Обновляем UI если нужно
-        if (!quadEnabled && mConnect != null) {
-            mConnect.setText(mHost);
-            mConnect.setVisibility(View.VISIBLE);
-        }
-        
-        // Показываем уведомление
-        android.widget.Toast.makeText(this, 
-            "Settings updated from WebUI.\nRestarting stream...", 
-            android.widget.Toast.LENGTH_SHORT).show();
-    });
-}
-    
-    //
 }
