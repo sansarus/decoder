@@ -83,6 +83,12 @@ public class Decoder extends Activity {
     private final byte[] nalBuffer = new byte[1024 * 1024];
 
     private int nalSize;            // only touched on the network thread — no volatile needed
+
+    //add web server control
+    private WebServer webServer;   
+    private Thread webServerThread;
+    //
+    
     private volatile MediaCodec mDecoder;
     // Surface captured on the UI thread via TextureView.SurfaceTextureListener; volatile so the
     // network thread can safely read it in createDecoder() without holding any UI lock.
@@ -212,6 +218,12 @@ public class Decoder extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.decoder);
+
+
+
+        //web server adds
+    startWebServer();
+        //
 
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -749,6 +761,39 @@ public class Decoder extends Activity {
                     : LinearLayout.LayoutParams.MATCH_PARENT,
                     LinearLayout.LayoutParams.WRAP_CONTENT);
         });
+
+//web server adds
+
+         TextView webSettings = createItem("🌐 Web Settings");
+    layout.addView(webSettings);
+    webSettings.setOnClickListener(v -> {
+        popup.dismiss();
+        try {
+            // Получаем IP адрес устройства
+            java.net.NetworkInterface networkInterface = java.net.NetworkInterface.getByName("wlan0");
+            java.util.Enumeration<java.net.InetAddress> addresses = networkInterface.getInetAddresses();
+            while (addresses.hasMoreElements()) {
+                java.net.InetAddress addr = addresses.nextElement();
+                if (!addr.isLoopbackAddress() && addr.getAddress().length == 4) {
+                    String ip = addr.getHostAddress();
+                    Intent browserIntent = new Intent(Intent.ACTION_VIEW, 
+                        Uri.parse("http://" + ip + ":8080"));
+                    startActivity(browserIntent);
+                    break;
+                }
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Cannot open web settings: " + e.getMessage());
+            android.widget.Toast.makeText(this, 
+                "Cannot get IP address", android.widget.Toast.LENGTH_SHORT).show();
+        }
+    });
+//
+
+
+
+
+        
     }
 
     private TextView createItem(String title) {
@@ -1828,6 +1873,17 @@ public class Decoder extends Activity {
             nalQueue.clear();
             pcmQueue.clear();
         }
+//web server adds
+         if (webServer != null) {
+        webServer.stopServer();
+        webServer = null;
+        if (webServerThread != null) {
+            webServerThread.interrupt();
+            webServerThread = null;
+        }
+    }
+//
+        
     }
 
     @Override
@@ -2363,4 +2419,46 @@ public class Decoder extends Activity {
                 return super.onKeyDown(keyCode, event);
         }
     }
+
+    //web server adds
+    private void startWebServer() {
+    if (webServer == null) {
+        webServer = new WebServer(getSharedPreferences("settings", MODE_PRIVATE));
+        webServerThread = new Thread(webServer);
+        webServerThread.start();
+        
+        // Показываем IP адрес в логе
+        showWebServerAddress();
+    }
+}
+
+private void showWebServerAddress() {
+    try {
+        java.net.NetworkInterface networkInterface = java.net.NetworkInterface.getByName("wlan0");
+        java.util.Enumeration<java.net.InetAddress> addresses = networkInterface.getInetAddresses();
+        while (addresses.hasMoreElements()) {
+            java.net.InetAddress addr = addresses.nextElement();
+            if (!addr.isLoopbackAddress() && addr.getAddress().length == 4) {
+                String ip = addr.getHostAddress();
+                Log.i(TAG, "========================================");
+                Log.i(TAG, "Web Interface available at:");
+                Log.i(TAG, "http://" + ip + ":8080");
+                Log.i(TAG, "========================================");
+                
+                // Показываем Toast с адресом
+                runOnUiThread(() -> {
+                    android.widget.Toast.makeText(this, 
+                        "🌐 WebUI: http://" + ip + ":8080", 
+                        android.widget.Toast.LENGTH_LONG).show();
+                });
+                break;
+            }
+        }
+    } catch (Exception e) {
+        Log.e(TAG, "Cannot get IP address: " + e.getMessage());
+    }
+}
+
+    
+    //
 }
